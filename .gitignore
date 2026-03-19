@@ -1,0 +1,8 @@
+output/
+node_modules/
+*.mp4
+*.mp3
+*.jpg
+*.png
+credentials.json
+.env
