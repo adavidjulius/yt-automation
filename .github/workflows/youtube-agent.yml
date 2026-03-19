@@ -12,7 +12,7 @@ on:
 
 jobs:
   generate-and-upload:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04      # Pin to 22.04 — more stable mirrors than latest
     timeout-minutes: 30
 
     steps:
@@ -20,6 +20,9 @@ jobs:
       # ─── 1. CHECKOUT REPO ────────────────────────────────────────────────
       - name: 📂 Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       # ─── 2. SETUP NODE.JS ────────────────────────────────────────────────
       - name: 🟢 Setup Node.js
@@ -27,27 +30,56 @@ jobs:
         with:
           node-version: '20'
 
-      # ─── 3. INSTALL DEPENDENCIES ─────────────────────────────────────────
-      - name: 📦 Install dependencies
+      # ─── 3. SETUP PYTHON ─────────────────────────────────────────────────
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # ─── 4. INSTALL FFMPEG (bypass mirror issues) ────────────────────────
+      - name: 🎞️ Install FFmpeg
+        run: |
+          # Bypass broken Ubuntu mirrors entirely — use direct archive
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+          # Update and install with fix-missing
+          sudo apt-get update -o Acquire::Retries=3 --fix-missing || true
+
+          # Retry loop — 3 attempts
+          for i in 1 2 3; do
+            sudo apt-get install -y ffmpeg --fix-missing && echo "✅ FFmpeg installed" && break
+            echo "⚠️ Attempt $i failed — retrying in 15s..."
+            sleep 15
+            sudo apt-get update --fix-missing || true
+          done
+
+          # Fallback: install via snap if apt fails
+          ffmpeg -version > /dev/null 2>&1 || sudo snap install ffmpeg
+
+          # Final check
+          ffmpeg -version | head -1
+
+      # ─── 5. INSTALL NODE + PYTHON PACKAGES ───────────────────────────────
+      - name: 📦 Install packages
         run: |
           npm install axios form-data node-fetch
-          sudo apt-get install -y ffmpeg
-          echo "✅ Dependencies ready"
+          pip install gTTS --quiet
+          echo "✅ All packages ready"
 
-      # ─── 4. PICK TOPIC ───────────────────────────────────────────────────
+      # ─── 6. PICK TOPIC ───────────────────────────────────────────────────
       - name: 🎯 Pick today's topic
         id: topic
         run: |
           if [ -n "${{ github.event.inputs.topic }}" ]; then
             TOPIC="${{ github.event.inputs.topic }}"
           else
-            # Pick a random topic from topics.txt
             TOPIC=$(shuf -n 1 topics.txt)
           fi
           echo "topic=$TOPIC" >> $GITHUB_OUTPUT
           echo "🎬 Today's topic: $TOPIC"
 
-      # ─── 5. GENERATE SCRIPT VIA GROK API ─────────────────────────────────
+      # ─── 7. GENERATE SCRIPT (Grok API) ───────────────────────────────────
       - name: 🤖 Generate script with Grok
         id: script
         env:
@@ -56,49 +88,50 @@ jobs:
           node scripts/generate_script.js "${{ steps.topic.outputs.topic }}"
           echo "✅ Script generated"
 
-      # ─── 6. GENERATE METADATA (Title, Desc, Tags) ─────────────────────────
+      # ─── 8. GENERATE METADATA (Title, Desc, Tags) ────────────────────────
       - name: 📝 Generate YouTube metadata
-        id: metadata
         env:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           node scripts/generate_metadata.js
           echo "✅ Metadata generated"
 
-      # ─── 7. GENERATE VOICEOVER (Free - Google TTS via gTTS) ──────────────
-      - name: 🎙️ Generate voiceover (free TTS)
+      # ─── 9. GENERATE VOICEOVER (gTTS — free, no key) ─────────────────────
+      - name: 🎙️ Generate voiceover
         run: |
-          pip install gTTS --quiet
           python3 scripts/generate_tts.py
-          echo "✅ Voiceover created: output/voiceover.mp3"
+          ls -lh output/voiceover.mp3
+          echo "✅ Voiceover ready"
 
-      # ─── 8. DOWNLOAD SCENE IMAGES (Pollinations.ai - FREE) ───────────────
-      - name: 🖼️ Download scene images (Pollinations.ai)
+      # ─── 10. DOWNLOAD SCENE IMAGES (Pollinations.ai — free, no key) ──────
+      - name: 🖼️ Download scene images
         run: |
           node scripts/download_images.js
-          echo "✅ Scene images downloaded"
+          echo "✅ Images downloaded"
 
-      # ─── 9. DOWNLOAD FREE BACKGROUND MUSIC ────────────────────────────────
-      - name: 🎵 Get background music (Pixabay free)
+      # ─── 11. GET BACKGROUND MUSIC (Pixabay — free) ───────────────────────
+      - name: 🎵 Get background music
         env:
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
         run: |
           node scripts/get_music.js
-          echo "✅ Background music ready"
+          echo "✅ Music ready"
 
-      # ─── 10. ASSEMBLE VIDEO WITH FFMPEG ────────────────────────────────────
-      - name: 🎬 Assemble video with FFmpeg
+      # ─── 12. ASSEMBLE VIDEO (FFmpeg) ──────────────────────────────────────
+      - name: 🎬 Assemble video
         run: |
           node scripts/assemble_video.js
-          echo "✅ Video assembled: output/final_video.mp4"
+          ls -lh output/final_video.mp4
+          echo "✅ Video assembled"
 
-      # ─── 11. GENERATE THUMBNAIL (Pollinations.ai) ──────────────────────────
+      # ─── 13. GENERATE THUMBNAIL (Pollinations.ai — free) ─────────────────
       - name: 🖼️ Generate thumbnail
         run: |
           node scripts/generate_thumbnail.js
+          ls -lh output/thumbnail.jpg
           echo "✅ Thumbnail ready"
 
-      # ─── 12. UPLOAD TO YOUTUBE ─────────────────────────────────────────────
+      # ─── 14. UPLOAD TO YOUTUBE ────────────────────────────────────────────
       - name: 📤 Upload to YouTube
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
@@ -106,15 +139,16 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           node scripts/upload_youtube.js
-          echo "✅ Video uploaded to YouTube!"
+          echo "✅ Uploaded to YouTube!"
 
-      # ─── 13. SAVE LOG ─────────────────────────────────────────────────────
+      # ─── 15. SAVE LOG (always runs even if steps above fail) ─────────────
       - name: 📊 Save run log
         if: always()
         run: |
-          echo "$(date): ${{ steps.topic.outputs.topic }}" >> logs/history.txt
-          git config user.email "bot@github.com"
-          git config user.name "YouTube Bot"
-          git add logs/
+          mkdir -p logs
+          echo "$(date '+%Y-%m-%d %H:%M') | ${{ steps.topic.outputs.topic }}" >> logs/history.txt
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add logs/history.txt
           git diff --staged --quiet || git commit -m "📝 Log: ${{ steps.topic.outputs.topic }}"
           git push || true
