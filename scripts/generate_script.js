@@ -1,22 +1,21 @@
 // scripts/generate_script.js
-// Calls Grok API (xAI) to generate a YouTube video script
-// Uses grok-3-fast model — cheapest, fastest, great for scripts
+// Calls Groq API to generate a YouTube video script
+// Free tier: 1000 requests/day — no credit card needed
 
 const fs = require('fs');
 const https = require('https');
-const path = require('path');
 
 const topic = process.argv[2] || 'Top 5 AI Tools in 2026';
 
-async function callGrok(prompt) {
+async function callGroq(prompt) {
   const body = JSON.stringify({
-    model: 'grok-3-fast',        // cheapest model, still excellent
+    model: 'llama-3.3-70b-versatile',
     max_tokens: 1000,
+    temperature: 0.7,
     messages: [
       {
         role: 'system',
-        content: `You are an expert YouTube scriptwriter. You write viral, engaging scripts 
-                  that keep viewers hooked. Always use a conversational, energetic tone.`
+        content: 'You are an expert YouTube scriptwriter. You write viral, engaging scripts that keep viewers hooked. Always use a conversational, energetic tone.'
       },
       {
         role: 'user',
@@ -27,8 +26,8 @@ async function callGrok(prompt) {
 
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'api.x.ai',
-      path: '/v1/chat/completions',
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -43,9 +42,11 @@ async function callGrok(prompt) {
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
+          if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+          if (!json.choices || !json.choices[0]) throw new Error('No choices in response: ' + data);
           resolve(json.choices[0].message.content);
         } catch (e) {
-          reject(new Error('Failed to parse Grok response: ' + data));
+          reject(new Error('Failed to parse Groq response: ' + e.message));
         }
       });
     });
@@ -59,7 +60,6 @@ async function callGrok(prompt) {
 async function main() {
   console.log(`🎬 Generating script for: "${topic}"`);
 
-  // Make output dir
   if (!fs.existsSync('output')) fs.mkdirSync('output');
 
   const prompt = `Write a 90-second YouTube video script about: "${topic}"
@@ -90,9 +90,8 @@ CTA:
 VOICEOVER:
 [The complete script as one flowing paragraph the narrator will read aloud - natural speech, no scene labels]`;
 
-  const script = await callGrok(prompt);
-  
-  // Parse the script sections
+  const script = await callGroq(prompt);
+
   const sections = {};
   const lines = script.split('\n');
   let currentSection = null;
@@ -114,7 +113,6 @@ VOICEOVER:
     sections[currentSection] = currentContent.join('\n').trim();
   }
 
-  // Save full script
   fs.writeFileSync('output/script.json', JSON.stringify({ topic, sections, raw: script }, null, 2));
   fs.writeFileSync('output/voiceover_text.txt', sections.VOICEOVER || script);
 
