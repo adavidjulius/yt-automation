@@ -1,20 +1,31 @@
 // scripts/generate_metadata.js
-// Uses Grok to generate YouTube title, description, tags from the script
+// Uses Groq API to generate YouTube title, description, tags from the script
+// Free tier: 1000 requests/day — no credit card needed
 
 const fs = require('fs');
 const https = require('https');
 
-async function callGrok(prompt) {
+async function callGroq(prompt) {
   const body = JSON.stringify({
-    model: 'grok-3-fast',
-    max_tokens: 600,
-    messages: [{ role: 'user', content: prompt }]
+    model: 'llama-3.3-70b-versatile',
+    max_tokens: 800,
+    temperature: 0.7,
+    messages: [
+      {
+        role: 'system',
+        content: 'You are a YouTube SEO expert. You only respond with valid JSON. No markdown, no backticks, no explanation — pure JSON only.'
+      },
+      {
+        role: 'user',
+        content: prompt
+      }
+    ]
   });
 
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'api.x.ai',
-      path: '/v1/chat/completions',
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -23,64 +34,145 @@ async function callGrok(prompt) {
       }
     };
 
-    const req = https.request(options, (res) => {
+    const req = https.request(options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          resolve(JSON.parse(data).choices[0].message.content);
+          const json = JSON.parse(data);
+          if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+          if (!json.choices || !json.choices[0]) throw new Error('No choices in response: ' + data);
+          resolve(json.choices[0].message.content);
         } catch (e) {
-          reject(new Error('Parse error: ' + data));
+          reject(new Error('Groq API error: ' + e.message));
         }
       });
     });
+
     req.on('error', reject);
     req.write(body);
     req.end();
   });
 }
 
+function buildFallbackMetadata(topic) {
+  const cleanTopic = topic.replace(/\s+/g, '');
+  return {
+    title: `${topic} | Complete Guide ${new Date().getFullYear()}`,
+    description: `In this video, we cover everything you need to know about ${topic}.\n\n` +
+      `Whether you're a beginner or advanced, this guide will help you understand ${topic} step by step.\n\n` +
+      `📌 Timestamps:\n0:00 - Introduction\n0:15 - Main Points\n1:00 - Summary\n\n` +
+      `👍 Like this video if it helped!\n🔔 Subscribe for daily AI & tech tips!\n💬 Comment your questions below!\n\n` +
+      `#${cleanTopic} #AI #YouTube #Tutorial #${new Date().getFullYear()}`,
+    tags: [
+      topic,
+      `${topic} tutorial`,
+      `${topic} guide`,
+      'AI tools',
+      'free AI',
+      'YouTube automation',
+      'tutorial',
+      'how to',
+      `${new Date().getFullYear()}`,
+      'beginners guide'
+    ],
+    category: '22',
+    thumbnail_prompt: `Eye-catching YouTube thumbnail for "${topic}", bold text overlay, vibrant neon colors, dark background, professional studio lighting, high contrast, 4K`
+  };
+}
+
+function extractJSON(text) {
+  // Try direct parse first
+  try {
+    return JSON.parse(text.trim());
+  } catch {}
+
+  // Strip markdown code fences
+  const stripped = text.replace(/```json|```/gi, '').trim();
+  try {
+    return JSON.parse(stripped);
+  } catch {}
+
+  // Find first { ... } block
+  const match = stripped.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      return JSON.parse(match[0]);
+    } catch {}
+  }
+
+  // Give up — return null
+  return null;
+}
+
 async function main() {
+  // Read script data
+  if (!fs.existsSync('output/script.json')) {
+    throw new Error('output/script.json not found — run generate_script.js first');
+  }
+
   const scriptData = JSON.parse(fs.readFileSync('output/script.json', 'utf8'));
   const { topic, raw } = scriptData;
 
-  console.log('📝 Generating YouTube metadata...');
+  console.log(`📝 Generating YouTube metadata for: "${topic}"`);
 
-  const prompt = `Based on this YouTube video script about "${topic}", generate metadata.
+  const prompt = `Generate YouTube metadata for a video about "${topic}".
 
-Script:
-${raw}
+Here is the video script:
+${raw.substring(0, 1500)}
 
-Return ONLY a valid JSON object with no markdown, no backticks, exactly this structure:
+Return ONLY a valid raw JSON object — no markdown, no backticks, no explanation.
+Use exactly this structure:
 {
-  "title": "Clickbait but accurate YouTube title under 70 characters",
-  "description": "SEO-optimized YouTube description, 150-200 words. Include timestamps, relevant keywords, and a CTA to subscribe.",
+  "title": "Engaging YouTube title under 70 characters — make it curiosity-driven and clickable",
+  "description": "SEO-optimized description between 150-200 words. Include a hook sentence, 3-4 key points covered in the video, timestamps placeholder, call to subscribe, and 3-5 relevant hashtags at the end.",
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8", "tag9", "tag10"],
   "category": "22",
-  "thumbnail_prompt": "A vivid, detailed image generation prompt for a YouTube thumbnail that represents this video"
+  "thumbnail_prompt": "Detailed image generation prompt for a YouTube thumbnail — describe colors, mood, subject, text overlay ideas"
 }`;
 
-  const response = await callGrok(prompt);
-  
-  // Clean and parse JSON
-  const cleaned = response.replace(/```json|```/g, '').trim();
-  let metadata;
+  let metadata = null;
+
   try {
-    metadata = JSON.parse(cleaned);
-  } catch (e) {
-    // Fallback metadata if parse fails
-    metadata = {
-      title: `${topic} - Everything You Need to Know`,
-      description: `In this video, we cover everything about ${topic}. Watch till the end for the best insights!\n\n#${topic.replace(/\s+/g, '')} #YouTube #Education`,
-      tags: topic.split(' ').concat(['youtube', 'tutorial', 'guide', '2026']),
-      category: '22',
-      thumbnail_prompt: `Professional YouTube thumbnail about ${topic}, bold text, vibrant colors, high contrast`
-    };
+    const response = await callGroq(prompt);
+    console.log('🔍 Raw Groq response received, parsing...');
+    metadata = extractJSON(response);
+
+    if (!metadata) {
+      console.log('⚠️ Could not parse JSON from Groq response — using fallback');
+      metadata = buildFallbackMetadata(topic);
+    }
+  } catch (err) {
+    console.log(`⚠️ Groq call failed: ${err.message} — using fallback metadata`);
+    metadata = buildFallbackMetadata(topic);
   }
 
+  // Validate and sanitize all fields
+  if (!metadata.title || typeof metadata.title !== 'string') {
+    metadata.title = buildFallbackMetadata(topic).title;
+  }
+  if (!metadata.description || typeof metadata.description !== 'string') {
+    metadata.description = buildFallbackMetadata(topic).description;
+  }
+  if (!Array.isArray(metadata.tags) || metadata.tags.length === 0) {
+    metadata.tags = buildFallbackMetadata(topic).tags;
+  }
+  if (!metadata.category) metadata.category = '22';
+  if (!metadata.thumbnail_prompt) {
+    metadata.thumbnail_prompt = buildFallbackMetadata(topic).thumbnail_prompt;
+  }
+
+  // Enforce YouTube limits
+  metadata.title = metadata.title.substring(0, 100);
+  metadata.description = metadata.description.substring(0, 5000);
+  metadata.tags = metadata.tags.slice(0, 15).map(t => String(t).substring(0, 30));
+
+  // Save
   fs.writeFileSync('output/metadata.json', JSON.stringify(metadata, null, 2));
-  console.log('✅ Metadata saved');
+
+  console.log('✅ Metadata saved to output/metadata.json');
   console.log('📌 Title:', metadata.title);
+  console.log('🏷️ Tags:', metadata.tags.slice(0, 5).join(', ') + '...');
 }
 
 main().catch(err => {
