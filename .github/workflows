@@ -1,0 +1,120 @@
+name: 🎬 YouTube Auto-Poster (Free Tier)
+
+on:
+  schedule:
+    - cron: '0 9 * * *'     # Every day at 9:00 AM UTC
+  workflow_dispatch:          # Manual trigger from GitHub UI
+    inputs:
+      topic:
+        description: 'Video topic (leave blank for auto-pick from topics.txt)'
+        required: false
+        default: ''
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ─── 1. CHECKOUT REPO ────────────────────────────────────────────────
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      # ─── 2. SETUP NODE.JS ────────────────────────────────────────────────
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ─── 3. INSTALL DEPENDENCIES ─────────────────────────────────────────
+      - name: 📦 Install dependencies
+        run: |
+          npm install axios form-data node-fetch
+          sudo apt-get install -y ffmpeg
+          echo "✅ Dependencies ready"
+
+      # ─── 4. PICK TOPIC ───────────────────────────────────────────────────
+      - name: 🎯 Pick today's topic
+        id: topic
+        run: |
+          if [ -n "${{ github.event.inputs.topic }}" ]; then
+            TOPIC="${{ github.event.inputs.topic }}"
+          else
+            # Pick a random topic from topics.txt
+            TOPIC=$(shuf -n 1 topics.txt)
+          fi
+          echo "topic=$TOPIC" >> $GITHUB_OUTPUT
+          echo "🎬 Today's topic: $TOPIC"
+
+      # ─── 5. GENERATE SCRIPT VIA GROK API ─────────────────────────────────
+      - name: 🤖 Generate script with Grok
+        id: script
+        env:
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          node scripts/generate_script.js "${{ steps.topic.outputs.topic }}"
+          echo "✅ Script generated"
+
+      # ─── 6. GENERATE METADATA (Title, Desc, Tags) ─────────────────────────
+      - name: 📝 Generate YouTube metadata
+        id: metadata
+        env:
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          node scripts/generate_metadata.js
+          echo "✅ Metadata generated"
+
+      # ─── 7. GENERATE VOICEOVER (Free - Google TTS via gTTS) ──────────────
+      - name: 🎙️ Generate voiceover (free TTS)
+        run: |
+          pip install gTTS --quiet
+          python3 scripts/generate_tts.py
+          echo "✅ Voiceover created: output/voiceover.mp3"
+
+      # ─── 8. DOWNLOAD SCENE IMAGES (Pollinations.ai - FREE) ───────────────
+      - name: 🖼️ Download scene images (Pollinations.ai)
+        run: |
+          node scripts/download_images.js
+          echo "✅ Scene images downloaded"
+
+      # ─── 9. DOWNLOAD FREE BACKGROUND MUSIC ────────────────────────────────
+      - name: 🎵 Get background music (Pixabay free)
+        env:
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+        run: |
+          node scripts/get_music.js
+          echo "✅ Background music ready"
+
+      # ─── 10. ASSEMBLE VIDEO WITH FFMPEG ────────────────────────────────────
+      - name: 🎬 Assemble video with FFmpeg
+        run: |
+          node scripts/assemble_video.js
+          echo "✅ Video assembled: output/final_video.mp4"
+
+      # ─── 11. GENERATE THUMBNAIL (Pollinations.ai) ──────────────────────────
+      - name: 🖼️ Generate thumbnail
+        run: |
+          node scripts/generate_thumbnail.js
+          echo "✅ Thumbnail ready"
+
+      # ─── 12. UPLOAD TO YOUTUBE ─────────────────────────────────────────────
+      - name: 📤 Upload to YouTube
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          node scripts/upload_youtube.js
+          echo "✅ Video uploaded to YouTube!"
+
+      # ─── 13. SAVE LOG ─────────────────────────────────────────────────────
+      - name: 📊 Save run log
+        if: always()
+        run: |
+          echo "$(date): ${{ steps.topic.outputs.topic }}" >> logs/history.txt
+          git config user.email "bot@github.com"
+          git config user.name "YouTube Bot"
+          git add logs/
+          git diff --staged --quiet || git commit -m "📝 Log: ${{ steps.topic.outputs.topic }}"
+          git push || true
