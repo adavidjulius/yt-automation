@@ -39,41 +39,54 @@ jobs:
           sudo apt-get update -o Acquire::Retries=3 --fix-missing || true
           for i in 1 2 3; do
             sudo apt-get install -y ffmpeg --fix-missing && break
-            echo "⚠️ Attempt $i failed — retrying in 15s..."
+            echo "Attempt $i failed retrying in 15s..."
             sleep 15
             sudo apt-get update --fix-missing || true
           done
           ffmpeg -version | head -1
-          echo "✅ FFmpeg ready"
+          echo "FFmpeg ready"
 
       - name: 📦 Install Node packages
         run: |
           npm install axios form-data node-fetch
-          echo "✅ Node packages ready"
+          echo "Node packages ready"
 
       - name: 🐍 Install Python packages
         run: |
-          pip install requests gTTS soundfile numpy --quiet
+          pip install requests --quiet
+          pip install gTTS --quiet
+          pip install soundfile --quiet
+          pip install numpy --quiet
           pip install edge-tts --quiet
-          pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu --quiet
           pip install opencv-python-headless --quiet
-          pip install tqdm batch_face librosa --quiet
-          echo "✅ Python packages ready"
+          pip install tqdm --quiet
+          pip install librosa --quiet
+          pip install resampy --quiet
+          pip install scipy --quiet
+          pip install numba --quiet
+          pip install imageio --quiet
+          pip install imageio-ffmpeg --quiet
+          pip install scikit-learn --quiet
+          pip install joblib --quiet
+          pip install batch_face --quiet
+          pip install face_alignment --quiet
+          pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu --quiet
+          echo "Python packages ready"
 
       - name: 🔥 Fetch trending topic
         id: topic
         run: |
           if [ -n "${{ github.event.inputs.topic }}" ]; then
             TOPIC="${{ github.event.inputs.topic }}"
-            echo "📌 Manual topic: $TOPIC"
+            echo "Manual topic: $TOPIC"
           else
-            echo "🔍 Fetching trending topic..."
+            echo "Fetching trending topic..."
             TOPIC=$(python3 scripts/fetch_trending.py 2>/dev/null || echo "")
             if [ -z "$TOPIC" ]; then
               TOPIC=$(shuf -n 1 topics.txt)
-              echo "⚠️ Trending fetch failed — using topics.txt: $TOPIC"
+              echo "Trending fetch failed using topics.txt: $TOPIC"
             else
-              echo "🔥 Trending: $TOPIC"
+              echo "Trending: $TOPIC"
             fi
           fi
           echo "topic=$TOPIC" >> $GITHUB_OUTPUT
@@ -83,45 +96,44 @@ jobs:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           node scripts/generate_script.js "${{ steps.topic.outputs.topic }}"
-          cat output/voiceover_text.txt | head -3
-          echo "✅ Script generated"
+          echo "Script generated"
 
       - name: 📝 Generate metadata
         env:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           node scripts/generate_metadata.js
-          echo "✅ Metadata generated"
+          echo "Metadata generated"
 
       - name: 🎙️ Generate female voiceover
         run: |
           python3 scripts/generate_tts.py
           ls -lh output/voiceover.mp3
-          echo "✅ Female voiceover ready"
+          echo "Female voiceover ready"
 
       - name: 🎭 Generate lip-sync avatar
         run: |
-          python3 scripts/generate_avatar.py || echo "⚠️ Avatar failed — assemble will use fallback"
+          python3 scripts/generate_avatar.py || echo "Avatar failed continuing without"
           ls -lh output/ || true
-          echo "✅ Avatar step done"
+          echo "Avatar step done"
 
       - name: 🎵 Get background music
         env:
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
         run: |
-          node scripts/get_music.js || echo "⚠️ Music failed — continuing without"
-          echo "✅ Music step done"
+          node scripts/get_music.js || echo "Music failed continuing without"
+          echo "Music step done"
 
       - name: 🎬 Assemble YouTube Short
         run: |
           node scripts/assemble_video.js
           ls -lh output/final_video.mp4
-          echo "✅ Short assembled"
+          echo "Short assembled"
 
       - name: 🖼️ Generate thumbnail
         run: |
-          node scripts/generate_thumbnail.js || echo "⚠️ Thumbnail failed — continuing"
-          echo "✅ Thumbnail step done"
+          node scripts/generate_thumbnail.js || echo "Thumbnail failed continuing"
+          echo "Thumbnail step done"
 
       - name: 📤 Upload to YouTube Shorts
         env:
@@ -130,7 +142,7 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           node scripts/upload_youtube.js
-          echo "✅ Uploaded to YouTube!"
+          echo "Uploaded to YouTube!"
 
       - name: 📊 Save run log
         if: always()
@@ -140,5 +152,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add logs/history.txt
-          git diff --staged --quiet || git commit -m "📝 Log: ${{ steps.topic.outputs.topic }}"
+          git diff --staged --quiet || git commit -m "Log: ${{ steps.topic.outputs.topic }}"
           git push || true
