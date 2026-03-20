@@ -1,40 +1,67 @@
 // scripts/get_music.js
-// Downloads free background music from Pixabay API
-// Free API key: register at pixabay.com (takes 30 seconds)
+// Background music — Pixabay free API
+// Never crashes pipeline — music is optional
 
 const fs = require('fs');
 const https = require('https');
+const { spawnSync } = require('child_process');
 
 function download(url, dest) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    https.get(url, res => {
+  return new Promise((resolve) => {
+    const file = require('fs').createWriteStream(dest);
+    const proto = url.startsWith('https') ? https : require('http');
+    proto.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
       if (res.statusCode === 301 || res.statusCode === 302) {
         file.close();
-        return download(res.headers.location, dest).then(resolve).catch(reject);
+        return download(res.headers.location, dest).then(resolve);
       }
       res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
+      file.on('finish', () => { file.close(); resolve(true); });
+      file.on('error', () => { resolve(false); });
+    }).on('error', () => { resolve(false); });
   });
+}
+
+function isValidAudio(filepath) {
+  if (!fs.existsSync(filepath)) return false;
+  if (fs.statSync(filepath).size < 10000) return false;
+  try {
+    const r = spawnSync('ffprobe', [
+      '-v', 'error', '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filepath
+    ], { stdio: 'pipe' });
+    return r.stdout.toString().trim() === 'audio';
+  } catch { return false; }
+}
+
+function createSilent(filepath) {
+  try {
+    spawnSync('bash', ['-c',
+      `ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 120 "${filepath}" -y`
+    ], { stdio: 'pipe' });
+    console.log('  🔇 Silent background track created');
+  } catch {}
 }
 
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', c => data += c);
       res.on('end', () => resolve(data));
     }).on('error', reject);
   });
 }
 
 async function main() {
-  const outputPath = 'output/background_music.mp3';
+  const output = 'output/background_music.mp3';
+  if (!fs.existsSync('output')) fs.mkdirSync('output');
 
-  // If already downloaded, skip
-  if (fs.existsSync(outputPath)) {
-    console.log('🎵 Music already exists, skipping download');
+  // Already exists and valid
+  if (isValidAudio(output)) {
+    console.log('🎵 Music already exists — skipping');
     return;
   }
 
@@ -42,38 +69,37 @@ async function main() {
 
   if (apiKey) {
     try {
-      console.log('🎵 Fetching music from Pixabay (free)...');
+      console.log('🎵 Fetching from Pixabay...');
       const url = `https://pixabay.com/api/?key=${apiKey}&media_type=music&category=background&per_page=10&order=popular`;
       const data = JSON.parse(await httpsGet(url));
 
-      if (data.hits && data.hits.length > 0) {
-        // Pick a random track from top results
+      if (data.hits?.length > 0) {
+        // Pick random from top 5
         const track = data.hits[Math.floor(Math.random() * Math.min(5, data.hits.length))];
-        const musicUrl = track.audio || track.userImageURL;
+        const audioUrl = track.audio;
 
-        if (musicUrl) {
-          console.log(`  🎶 Downloading: "${track.tags}"`);
-          await download(musicUrl, outputPath);
-          console.log('✅ Background music downloaded from Pixabay');
-          return;
+        if (audioUrl) {
+          console.log(`  🎶 Downloading: "${track.tags?.substring(0, 40)}"`);
+          await download(audioUrl, output);
+
+          if (isValidAudio(output)) {
+            console.log(`✅ Music ready (${(fs.statSync(output).size/1024).toFixed(0)}KB)`);
+            return;
+          }
         }
       }
     } catch (e) {
-      console.log('⚠️ Pixabay failed, using fallback...');
+      console.log(`  ⚠️ Pixabay failed: ${e.message}`);
     }
+  } else {
+    console.log('⚠️ No PIXABAY_API_KEY — skipping music');
   }
 
-  // Fallback: Generate a simple silent audio track with FFmpeg
-  // (video will still work, just no background music)
-  console.log('⚠️ No Pixabay key — generating silent background track');
-  const { execSync } = require('child_process');
-  execSync(`ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 300 ${outputPath} -y`);
-  console.log('✅ Silent background track created (add PIXABAY_API_KEY secret for real music)');
+  // Silent fallback — never crash
+  createSilent(output);
 }
 
+// Never crash the pipeline — music is optional
 main().catch(err => {
-  console.error('❌ Music fetch failed:', err.message);
-  // Don't exit — music is optional
-  const { execSync } = require('child_process');
-  execSync(`ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 300 output/background_music.mp3 -y`);
+  console.log(`⚠️ Music step error: ${err.message} — continuing without music`);
 });
