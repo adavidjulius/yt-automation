@@ -1,28 +1,57 @@
 // scripts/assemble_video.js
-// Assembles images + voiceover + music into a final MP4 using FFmpeg
-// FFmpeg is 100% free, open source, no watermarks
+// Assembles images + voiceover + music into final MP4 using FFmpeg
 
 const fs = require('fs');
-const { execSync, exec } = require('child_process');
+const { execSync, spawnSync } = require('child_process');
 const path = require('path');
 
 function run(cmd) {
   console.log(`  🔧 ${cmd.substring(0, 80)}...`);
-  try {
-    execSync(cmd, { stdio: 'pipe' });
-  } catch (err) {
-    throw new Error(`FFmpeg error: ${err.stderr?.toString() || err.message}`);
+  const result = spawnSync('bash', ['-c', cmd], { stdio: 'pipe', timeout: 120000 });
+  if (result.status !== 0) {
+    const stderr = result.stderr ? result.stderr.toString() : '';
+    throw new Error(`FFmpeg error: ${stderr}`);
   }
 }
 
-async function getAudioDuration(audioPath) {
+function getAudioDuration(audioPath) {
   try {
     const result = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+      { stdio: 'pipe' }
     ).toString().trim();
-    return parseFloat(result);
+    const dur = parseFloat(result);
+    if (isNaN(dur) || dur <= 0) return 90;
+    return dur;
   } catch {
-    return 90; // Default 90 seconds
+    return 90;
+  }
+}
+
+function isValidAudio(filepath) {
+  if (!fs.existsSync(filepath)) return false;
+  if (fs.statSync(filepath).size < 1000) return false;
+  try {
+    // Check if ffprobe sees it as having an audio stream
+    const result = execSync(
+      `ffprobe -v error -select_streams a -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "${filepath}"`,
+      { stdio: 'pipe' }
+    ).toString().trim();
+    return result.includes('audio');
+  } catch {
+    return false;
+  }
+}
+
+function createSilentAudio(filepath, duration) {
+  try {
+    execSync(
+      `ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t ${duration} "${filepath}" -y`,
+      { stdio: 'pipe' }
+    );
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -31,9 +60,7 @@ async function main() {
   const { imagePaths } = manifest;
   const validImages = imagePaths.filter(p => p && fs.existsSync(p));
 
-  if (validImages.length === 0) {
-    throw new Error('No valid images found!');
-  }
+  if (validImages.length === 0) throw new Error('No valid images found!');
 
   const voiceoverPath = 'output/voiceover.mp3';
   const musicPath = 'output/background_music.mp3';
@@ -41,82 +68,95 @@ async function main() {
 
   console.log(`🎬 Assembling video with ${validImages.length} scenes...`);
 
-  // Get voiceover duration
-  const totalDuration = await getAudioDuration(voiceoverPath);
+  // ─── Validate voiceover ──────────────────────────────────────────────────
+  if (!isValidAudio(voiceoverPath)) {
+    throw new Error('Voiceover file is missing or not valid audio!');
+  }
+
+  const totalDuration = getAudioDuration(voiceoverPath);
   const sceneDuration = totalDuration / validImages.length;
-  
   console.log(`  ⏱️ Total duration: ${totalDuration.toFixed(1)}s`);
   console.log(`  🎞️ Scene duration: ${sceneDuration.toFixed(1)}s each`);
 
-  // ─── Step 1: Create video segments for each image ───────────────────────
+  // ─── Validate background music ───────────────────────────────────────────
+  let hasMusic = false;
+  if (fs.existsSync(musicPath)) {
+    if (isValidAudio(musicPath)) {
+      hasMusic = true;
+      console.log('  🎵 Background music: valid ✅');
+    } else {
+      console.log('  ⚠️ background_music.mp3 is not valid audio — skipping music');
+      // Remove the corrupt file so it doesn't cause issues
+      try { fs.unlinkSync(musicPath); } catch {}
+    }
+  } else {
+    console.log('  ⚠️ No background music file found — continuing without music');
+  }
+
+  // ─── Step 1: Create video segment for each image ────────────────────────
   const segmentPaths = [];
   for (let i = 0; i < validImages.length; i++) {
     const segPath = `output/segment_${i}.mp4`;
-    
-    // Create video from image with Ken Burns effect (slow zoom)
-    const scale = i % 2 === 0 ? '1.05' : '0.95'; // alternating zoom in/out
+    const frames = Math.ceil(sceneDuration * 25);
+    const zoomDir = i % 2 === 0 ? '+' : '-';
+    const zoomEnd = i % 2 === 0 ? '1.05' : '0.97';
+
     run(`ffmpeg -loop 1 -i "${validImages[i]}" \
-      -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(zoom+0.0015,${scale})':d=${Math.ceil(sceneDuration * 25)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080,setsar=1" \
+      -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(zoom+0.0015,${zoomEnd})':d=${frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080,setsar=1" \
       -t ${sceneDuration} \
-      -c:v libx264 -pix_fmt yuv420p \
-      -r 25 \
+      -c:v libx264 -pix_fmt yuv420p -r 25 \
       "${segPath}" -y`);
-    
+
     segmentPaths.push(segPath);
   }
 
-  // ─── Step 2: Concatenate all segments ───────────────────────────────────
+  // ─── Step 2: Concatenate segments ───────────────────────────────────────
   const concatFile = 'output/concat_list.txt';
-  const concatContent = segmentPaths.map(p => `file '${path.resolve(p)}'`).join('\n');
-  fs.writeFileSync(concatFile, concatContent);
+  fs.writeFileSync(concatFile, segmentPaths.map(p => `file '${path.resolve(p)}'`).join('\n'));
 
   const concatenatedPath = 'output/concatenated.mp4';
   run(`ffmpeg -f concat -safe 0 -i "${concatFile}" -c copy "${concatenatedPath}" -y`);
 
-  // ─── Step 3: Add voiceover + background music ────────────────────────────
-  const hasMusic = fs.existsSync(musicPath);
-  
+  // ─── Step 3: Mix audio ───────────────────────────────────────────────────
   if (hasMusic) {
+    // Voiceover + background music
     run(`ffmpeg -i "${concatenatedPath}" \
       -i "${voiceoverPath}" \
       -i "${musicPath}" \
-      -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.08[music];[voice][music]amix=inputs=2:duration=first[audio]" \
+      -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.08,apad[music];[voice][music]amix=inputs=2:duration=first[audio]" \
       -map 0:v -map "[audio]" \
-      -c:v copy -c:a aac \
+      -c:v copy -c:a aac -b:a 128k \
       -shortest \
       "${outputPath}" -y`);
   } else {
+    // Voiceover only — no background music
     run(`ffmpeg -i "${concatenatedPath}" \
       -i "${voiceoverPath}" \
       -map 0:v -map 1:a \
-      -c:v copy -c:a aac \
+      -c:v copy -c:a aac -b:a 128k \
       -shortest \
       "${outputPath}" -y`);
   }
 
-  // ─── Step 4: Add subtitles / captions overlay ───────────────────────────
-  // Add title card at the beginning
+  // ─── Step 4: Add title overlay ───────────────────────────────────────────
   const metadata = JSON.parse(fs.readFileSync('output/metadata.json', 'utf8'));
-  const title = metadata.title.replace(/'/g, "\\'");
-  
-  const finalWithTitle = 'output/final_with_title.mp4';
+  const title = metadata.title.replace(/[':]/g, '').substring(0, 50);
+  const finalWithTitle = 'output/final_titled.mp4';
+
   run(`ffmpeg -i "${outputPath}" \
-    -vf "drawtext=text='${title}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.6:boxborderw=10:x=(w-text_w)/2:y=h-h/5:enable='lt(t,4)'" \
+    -vf "drawtext=text='${title}':fontcolor=white:fontsize=44:box=1:boxcolor=black@0.6:boxborderw=10:x=(w-text_w)/2:y=h-150:enable='lt(t,4)'" \
     -c:v libx264 -c:a copy \
     "${finalWithTitle}" -y`);
 
-  // Rename to final
   fs.renameSync(finalWithTitle, outputPath);
 
-  // ─── Cleanup temp files ────────────────────────────────────────────────
+  // ─── Cleanup ─────────────────────────────────────────────────────────────
   segmentPaths.forEach(p => { try { fs.unlinkSync(p); } catch {} });
   try { fs.unlinkSync(concatenatedPath); } catch {}
+  try { fs.unlinkSync(concatFile); } catch {}
 
-  // Check output size
-  const stats = fs.statSync(outputPath);
-  const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
-
-  console.log(`✅ Video assembled: ${outputPath}`);
+  const sizeMB = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
+  console.log(`\n✅ Video assembled: ${outputPath}`);
   console.log(`📦 File size: ${sizeMB} MB`);
   console.log(`⏱️ Duration: ${totalDuration.toFixed(0)} seconds`);
 }
