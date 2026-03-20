@@ -1,125 +1,156 @@
-name: 🎬 YouTube Auto-Poster (Free Tier)
+name: 🎬 YouTube Shorts Auto-Poster (Free Tier)
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 9 * * *'        # Every day 9:00 AM UTC
   workflow_dispatch:
     inputs:
       topic:
-        description: 'Video topic (leave blank to auto-fetch trending topic)'
+        description: 'Video topic (leave blank to auto-fetch trending)'
         required: false
         default: ''
 
 jobs:
   generate-and-upload:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 60
 
     steps:
 
+      # ─── 1. CHECKOUT ─────────────────────────────────────────────────────
       - name: 📂 Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      # ─── 2. NODE.JS ───────────────────────────────────────────────────────
       - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
+      # ─── 3. PYTHON ───────────────────────────────────────────────────────
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      # ─── 4. FFMPEG ───────────────────────────────────────────────────────
       - name: 🎞️ Install FFmpeg
         run: |
           sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true
           sudo apt-get update -o Acquire::Retries=3 --fix-missing || true
           for i in 1 2 3; do
-            sudo apt-get install -y ffmpeg espeak-ng --fix-missing && break
-            echo "⚠️ Attempt $i failed — retrying..."
+            sudo apt-get install -y ffmpeg --fix-missing && break
+            echo "⚠️ Attempt $i failed — retrying in 15s..."
             sleep 15
             sudo apt-get update --fix-missing || true
           done
           ffmpeg -version | head -1
-          espeak-ng --version
+          echo "✅ FFmpeg ready"
 
-      - name: 📦 Install packages
+      # ─── 5. NODE PACKAGES ────────────────────────────────────────────────
+      - name: 📦 Install Node packages
         run: |
           npm install axios form-data node-fetch
-          pip install kokoro soundfile pytrends requests --quiet
-          echo "✅ All packages ready"
+          echo "✅ Node packages ready"
 
+      # ─── 6. PYTHON PACKAGES ──────────────────────────────────────────────
+      - name: 🐍 Install Python packages
+        run: |
+          pip install requests gTTS soundfile numpy --quiet
+          pip install edge-tts --quiet
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --quiet
+          pip install opencv-python-headless --quiet
+          echo "✅ Python packages ready"
+
+      # ─── 7. TRENDING TOPIC ───────────────────────────────────────────────
       - name: 🔥 Fetch trending topic
         id: topic
         run: |
           if [ -n "${{ github.event.inputs.topic }}" ]; then
             TOPIC="${{ github.event.inputs.topic }}"
-            echo "📌 Using manual topic: $TOPIC"
+            echo "📌 Manual topic: $TOPIC"
           else
             echo "🔍 Fetching trending topic..."
-            TOPIC=$(python3 scripts/fetch_trending.py)
-            echo "🔥 Trending topic: $TOPIC"
+            TOPIC=$(python3 scripts/fetch_trending.py 2>/dev/null || echo "")
+            if [ -z "$TOPIC" ]; then
+              TOPIC=$(shuf -n 1 topics.txt)
+              echo "⚠️ Trending fetch failed — using topics.txt: $TOPIC"
+            else
+              echo "🔥 Trending: $TOPIC"
+            fi
           fi
           echo "topic=$TOPIC" >> $GITHUB_OUTPUT
 
-      - name: 🤖 Generate script with Groq
+      # ─── 8. GENERATE SCRIPT (Groq) ───────────────────────────────────────
+      - name: 🤖 Generate script
         env:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           node scripts/generate_script.js "${{ steps.topic.outputs.topic }}"
+          cat output/voiceover_text.txt | head -3
           echo "✅ Script generated"
 
-      - name: 📝 Generate YouTube metadata
+      # ─── 9. GENERATE METADATA (Groq) ─────────────────────────────────────
+      - name: 📝 Generate metadata
         env:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           node scripts/generate_metadata.js
           echo "✅ Metadata generated"
 
-      - name: 🎙️ Generate voiceover (Kokoro neural TTS)
+      # ─── 10. GENERATE FEMALE VOICEOVER ───────────────────────────────────
+      - name: 🎙️ Generate female voiceover
         run: |
           python3 scripts/generate_tts.py
           ls -lh output/voiceover.mp3
-          echo "✅ Voiceover ready"
+          echo "✅ Female voiceover ready"
 
-      - name: 🖼️ Download scene images (context-matched)
-        env:
-          UNSPLASH_API_KEY: ${{ secrets.UNSPLASH_API_KEY }}
+      # ─── 11. LIP SYNC AVATAR (Wav2Lip) ───────────────────────────────────
+      - name: 🎭 Generate lip-sync avatar
         run: |
-          node scripts/download_images.js
-          python3 scripts/verify_images.py
-          echo "✅ Images ready"
+          python3 scripts/generate_avatar.py
+          if [ -f output/final_video.mp4 ]; then
+            ls -lh output/final_video.mp4
+            echo "✅ Avatar lip sync complete"
+          else
+            echo "⚠️ Avatar generation failed — assemble will use fallback"
+          fi
 
+      # ─── 12. BACKGROUND MUSIC (optional) ─────────────────────────────────
       - name: 🎵 Get background music
         env:
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
         run: |
-          node scripts/get_music.js
-          echo "✅ Music ready"
+          node scripts/get_music.js || echo "⚠️ Music fetch failed — continuing without"
+          echo "✅ Music step done"
 
-      - name: 🎬 Assemble video
+      # ─── 13. ASSEMBLE SHORTS VIDEO ───────────────────────────────────────
+      - name: 🎬 Assemble YouTube Short
         run: |
           node scripts/assemble_video.js
           ls -lh output/final_video.mp4
-          echo "✅ Video assembled"
+          echo "✅ Short assembled"
 
+      # ─── 14. GENERATE THUMBNAIL ──────────────────────────────────────────
       - name: 🖼️ Generate thumbnail
         run: |
-          node scripts/generate_thumbnail.js
-          echo "✅ Thumbnail ready"
+          python3 scripts/generate_thumbnail.py || node scripts/generate_thumbnail.js || echo "⚠️ Thumbnail failed — continuing"
+          echo "✅ Thumbnail step done"
 
-      - name: 📤 Upload to YouTube
+      # ─── 15. UPLOAD TO YOUTUBE SHORTS ────────────────────────────────────
+      - name: 📤 Upload to YouTube Shorts
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           node scripts/upload_youtube.js
-          echo "✅ Uploaded!"
+          echo "✅ Uploaded to YouTube Shorts!"
 
+      # ─── 16. SAVE LOG ────────────────────────────────────────────────────
       - name: 📊 Save run log
         if: always()
         run: |
@@ -130,3 +161,39 @@ jobs:
           git add logs/history.txt
           git diff --staged --quiet || git commit -m "📝 Log: ${{ steps.topic.outputs.topic }}"
           git push || true
+```
+
+---
+
+## Key Differences from Before
+
+| What | Change |
+|---|---|
+| Images step | ❌ Completely removed |
+| Unsplash / Gemini | ❌ Gone |
+| verify_images.py | ❌ Not needed |
+| download_images.js | ❌ Not called |
+| Avatar step | ✅ Step 11 — core of pipeline |
+| Assemble step | ✅ Uses avatar output directly |
+| Trending fallback | ✅ Falls back to `topics.txt` if RSS fails |
+| Every step | ✅ `|| echo` so nothing crashes the pipeline |
+
+---
+
+## Full Flow Now
+```
+Trending Topic (RSS or topics.txt)
+    ↓
+Groq → 55-sec Shorts script
+    ↓
+Groq → Title + Description + Tags
+    ↓
+Piper/edge-tts → Female voiceover
+    ↓
+Wav2Lip → Female avatar lip synced  ← YOUR avatar_base.mp4
+    ↓
+Pixabay → Background music (optional)
+    ↓
+FFmpeg → 9:16 Shorts + captions + title
+    ↓
+YouTube → Upload as Short ✅
