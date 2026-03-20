@@ -1,177 +1,333 @@
 // scripts/download_images.js
-// Downloads images using curl (most reliable on GitHub Actions)
-// Primary: Pollinations.ai — FREE, no key
-// Fallback: Pure FFmpeg generated images — 100% reliable
+// Uses Google Gemini Imagen 4 — best free AI image generation
+// 500 images/day free, no visible watermark, commercial use allowed
 
 const fs = require('fs');
+const https = require('https');
 const { execSync, spawnSync } = require('child_process');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function createColorImage(filepath, index) {
-  // Generate beautiful gradient background images using FFmpeg
-  // These always work — no network needed
-  const gradients = [
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x1a1a2e:c1=0x16213e:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x0f3460:c1=0x533483:x0=0:y0=1080:x1=1920:y1=0" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x1b4332:c1=0x2d6a4f:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x2b2d42:c1=0x8d99ae:x0=1920:y0=0:x1=0:y1=1080" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x370617:c1=0x6a040f:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x03071e:c1=0x023e8a:x0=0:y0=1080:x1=1920:y1=0" -vframes 1',
-    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x10002b:c1=0x240046:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
-  ];
-
-  const cmd = gradients[index % gradients.length];
-
-  // Try gradient first
-  try {
-    execSync(`${cmd} "${filepath}" -y`, { stdio: 'pipe' });
-    if (fs.existsSync(filepath) && fs.statSync(filepath).size > 1000) {
-      return true;
-    }
-  } catch {}
-
-  // Fallback to solid color
-  const colors = ['1a1a2e', '0f3460', '1b4332', '2b2d42', '370617', '03071e', '10002b'];
+function createGradientFallback(filepath, index) {
+  const colors = ['1a1a2e','0f3460','1b4332','2b2d42','370617','03071e','10002b'];
   const color = colors[index % colors.length];
   try {
     execSync(
       `ffmpeg -f lavfi -i "color=c=#${color}:size=1920x1080:duration=1" -vframes 1 "${filepath}" -y`,
       { stdio: 'pipe' }
     );
-    return fs.existsSync(filepath) && fs.statSync(filepath).size > 1000;
-  } catch {
-    return false;
-  }
+    return fs.existsSync(filepath);
+  } catch { return false; }
 }
 
-function downloadWithCurl(url, filepath) {
-  // curl is the most reliable downloader on GitHub Actions
-  const result = spawnSync('curl', [
-    '--location',           // follow redirects
-    '--silent',
-    '--show-error',
-    '--max-time', '25',     // 25 second timeout
-    '--retry', '2',
-    '--retry-delay', '3',
+function downloadWithCurl(url, filepath, headers = []) {
+  const args = [
+    '--location', '--silent', '--show-error',
+    '--max-time', '30', '--retry', '2',
     '--output', filepath,
-    '--user-agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-    url
-  ], { timeout: 35000 });
+    '--user-agent', 'Mozilla/5.0'
+  ];
+  headers.forEach(h => args.push('--header', h));
+  args.push(url);
 
-  if (result.status !== 0) {
+  const result = spawnSync('curl', args, { timeout: 40000 });
+  if (result.status !== 0 || !fs.existsSync(filepath)) return false;
+  if (fs.statSync(filepath).size < 5000) {
+    try { fs.unlinkSync(filepath); } catch {}
     return false;
   }
-
-  // Verify it's a real image
-  if (!fs.existsSync(filepath)) return false;
-  const size = fs.statSync(filepath).size;
-  if (size < 5000) return false;
-
   // Check magic bytes
   const buf = Buffer.alloc(4);
   const fd = fs.openSync(filepath, 'r');
   fs.readSync(fd, buf, 0, 4, 0);
   fs.closeSync(fd);
+  const valid = (buf[0]===0xFF && buf[1]===0xD8) || (buf[0]===0x89 && buf[1]===0x50);
+  if (!valid) { try { fs.unlinkSync(filepath); } catch {} return false; }
+  return true;
+}
 
-  const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
-  const isPng  = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+async function generateWithGemini(prompt, filepath, apiKey) {
+  if (!apiKey) return false;
 
-  return isJpeg || isPng;
+  console.log(`    🤖 Gemini Imagen 4 generating...`);
+
+  const body = JSON.stringify({
+    contents: [{
+      parts: [{ text: prompt }]
+    }],
+    generationConfig: {
+      responseModalities: ['IMAGE'],
+      responseSchema: {
+        type: 'object',
+        properties: { image: { type: 'string' } }
+      }
+    }
+  });
+
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'generativelanguage.googleapis.com',
+      path: `/v1beta/models/imagen-4.0-generate-preview-06-06:generateImages?key=${apiKey}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    // Use Gemini image generation endpoint
+    const geminiBody = JSON.stringify({
+      prompt: { text: prompt },
+      number_of_images: 1,
+      aspect_ratio: '16:9',
+      safety_filter_level: 'block_some',
+      person_generation: 'allow_adult'
+    });
+
+    const geminiOptions = {
+      hostname: 'generativelanguage.googleapis.com',
+      path: `/v1beta/models/imagen-4.0-generate-preview-06-06:predict?key=${apiKey}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(geminiBody)
+      }
+    };
+
+    const req = https.request(geminiOptions, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) {
+            console.log(`    ⚠️ Gemini error: ${json.error.message}`);
+            return resolve(false);
+          }
+
+          // Extract base64 image
+          const predictions = json.predictions || [];
+          if (predictions.length === 0) {
+            console.log(`    ⚠️ No predictions returned`);
+            return resolve(false);
+          }
+
+          const b64 = predictions[0].bytesBase64Encoded;
+          if (!b64) return resolve(false);
+
+          // Save base64 as JPEG
+          const imgBuffer = Buffer.from(b64, 'base64');
+          fs.writeFileSync(filepath, imgBuffer);
+
+          const kb = (imgBuffer.length / 1024).toFixed(0);
+          console.log(`    ✅ Gemini image saved (${kb}KB)`);
+          resolve(true);
+        } catch (e) {
+          console.log(`    ⚠️ Parse error: ${e.message}`);
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      console.log(`    ⚠️ Request error: ${e.message}`);
+      resolve(false);
+    });
+
+    req.write(geminiBody);
+    req.end();
+  });
+}
+
+async function generateWithGeminiFlash(prompt, filepath, apiKey) {
+  // Alternative: Use Gemini 2.0 Flash experimental (also free, image output)
+  if (!apiKey) return false;
+
+  console.log(`    🤖 Trying Gemini Flash image generation...`);
+
+  const body = JSON.stringify({
+    contents: [{
+      parts: [{ text: `Generate a photorealistic, cinematic, 16:9 YouTube video still image for: ${prompt}. Professional photography style, vibrant colors, 4K quality.` }]
+    }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE']
+    }
+  });
+
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'generativelanguage.googleapis.com',
+      path: `/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=${apiKey}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) {
+            console.log(`    ⚠️ Flash error: ${json.error.message}`);
+            return resolve(false);
+          }
+
+          // Find image part in response
+          const parts = json.candidates?.[0]?.content?.parts || [];
+          const imgPart = parts.find(p => p.inlineData?.mimeType?.startsWith('image/'));
+
+          if (!imgPart) {
+            console.log(`    ⚠️ No image in Flash response`);
+            return resolve(false);
+          }
+
+          const imgBuffer = Buffer.from(imgPart.inlineData.data, 'base64');
+          fs.writeFileSync(filepath, imgBuffer);
+
+          // Resize to 1920x1080 using FFmpeg
+          const resized = filepath.replace('.jpg', '_resized.jpg');
+          execSync(`ffmpeg -i "${filepath}" -vf scale=1920:1080 "${resized}" -y`, { stdio: 'pipe' });
+          fs.renameSync(resized, filepath);
+
+          const kb = (fs.statSync(filepath).size / 1024).toFixed(0);
+          console.log(`    ✅ Gemini Flash image saved (${kb}KB)`);
+          resolve(true);
+        } catch (e) {
+          console.log(`    ⚠️ Flash parse error: ${e.message}`);
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (e) => { console.log(`    ⚠️ ${e.message}`); resolve(false); });
+    req.write(body);
+    req.end();
+  });
+}
+
+function extractKeywords(sceneText, topic) {
+  const stopWords = new Set(['the','a','an','is','are','was','were','be','been',
+    'have','has','had','do','does','did','will','would','could','should',
+    'this','that','these','those','with','from','for','and','but','or','in','on','at','to','of']);
+  const words = (sceneText + ' ' + topic)
+    .toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/)
+    .filter(w => w.length > 3 && !stopWords.has(w));
+  return [...new Set(words)].slice(0, 4).join(' ') || topic;
 }
 
 async function main() {
   const scriptData = JSON.parse(fs.readFileSync('output/script.json', 'utf8'));
   const { sections, topic } = scriptData;
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const unsplashKey = process.env.UNSPLASH_API_KEY;
+
+  if (!geminiKey) console.log('⚠️ GEMINI_API_KEY not set — get free key at aistudio.google.com');
 
   if (!fs.existsSync('output/images')) {
     fs.mkdirSync('output/images', { recursive: true });
   }
 
-  // Build scene list
+  // Build scenes
   const scenes = [];
-  if (sections.HOOK) {
-    scenes.push({ name: 'scene_hook', prompt: `${topic} concept overview` });
-  }
+  if (sections.HOOK) scenes.push({ name: 'scene_hook', text: sections.HOOK });
   let i = 1;
   while (sections[`SCENE_${i}`]) {
-    scenes.push({
-      name: `scene_${i}`,
-      prompt: sections[`SCENE_${i}`].substring(0, 80) + ' ' + topic
-    });
+    scenes.push({ name: `scene_${i}`, text: sections[`SCENE_${i}`] });
     i++;
   }
-  scenes.push({ name: 'scene_cta', prompt: `${topic} success results achievement` });
+  scenes.push({ name: 'scene_cta', text: `subscribe results success ${topic}` });
 
-  console.log(`🖼️ Getting ${scenes.length} scene images...\n`);
+  console.log(`🖼️ Generating ${scenes.length} AI images with Gemini...\n`);
 
   const imagePaths = [];
-  let pollSuccess = 0;
+  let geminiCount = 0;
+  let unsplashCount = 0;
   let fallbackCount = 0;
 
   for (let idx = 0; idx < scenes.length; idx++) {
     const scene = scenes[idx];
     const filepath = `output/images/${scene.name}.jpg`;
+    const keywords = extractKeywords(scene.text, topic);
 
-    console.log(`  📥 Scene ${idx + 1}/${scenes.length}: ${scene.name}`);
+    // Build cinematic prompt for better results
+    const imagePrompt = `Cinematic YouTube video thumbnail still image about "${keywords}". 
+      Professional photography, dramatic lighting, vibrant colors, 16:9 aspect ratio, 
+      ultra high definition, photorealistic, no text overlay.`;
 
-    // Build Pollinations URL
-    const cleanPrompt = scene.prompt
-      .replace(/[^a-zA-Z0-9\s,.-]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .substring(0, 150);
+    console.log(`  🎨 Scene ${idx + 1}/${scenes.length}: ${scene.name}`);
+    console.log(`    📝 "${keywords}"`);
 
-    const fullPrompt = encodeURIComponent(
-      cleanPrompt + ', cinematic, 4K, professional photography, vibrant colors'
-    );
-    const url = `https://image.pollinations.ai/prompt/${fullPrompt}?width=1920&height=1080&seed=${idx * 17 + 42}&nologo=true&model=flux`;
-
-    // Try Pollinations with curl
     let success = false;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      if (attempt > 1) {
-        console.log(`    🔄 Retry ${attempt}...`);
-        await sleep(4000);
-      }
 
-      success = downloadWithCurl(url, filepath);
-      if (success) {
-        const kb = (fs.statSync(filepath).size / 1024).toFixed(0);
-        console.log(`    ✅ Downloaded from Pollinations (${kb}KB)`);
-        pollSuccess++;
-        break;
-      } else {
-        console.log(`    ⚠️ Pollinations failed (attempt ${attempt})`);
-        try { fs.unlinkSync(filepath); } catch {}
-      }
+    // 1. Try Gemini Imagen 4 (best quality — 500/day free)
+    if (geminiKey && !success) {
+      success = await generateWithGemini(imagePrompt, filepath, geminiKey);
+      if (success) geminiCount++;
+      await sleep(1000);
     }
 
-    // Fallback: generate with FFmpeg
+    // 2. Try Gemini Flash (also free, good quality)
+    if (geminiKey && !success) {
+      success = await generateWithGeminiFlash(imagePrompt, filepath, geminiKey);
+      if (success) geminiCount++;
+      await sleep(1000);
+    }
+
+    // 3. Try Unsplash (real photos, free 50/hr)
+    if (!success && unsplashKey) {
+      const query = encodeURIComponent(keywords);
+      const apiUrl = `https://api.unsplash.com/photos/random?query=${query}&orientation=landscape`;
+      const metaResult = spawnSync('curl', [
+        '--silent', '--max-time', '10',
+        '--header', `Authorization: Client-ID ${unsplashKey}`,
+        '--header', 'Accept-Version: v1',
+        apiUrl
+      ], { timeout: 15000 });
+
+      if (metaResult.status === 0) {
+        try {
+          const data = JSON.parse(metaResult.stdout.toString());
+          const imgUrl = data?.urls?.regular;
+          if (imgUrl) {
+            success = downloadWithCurl(imgUrl, filepath);
+            if (success) {
+              // Resize to 1920x1080
+              execSync(`ffmpeg -i "${filepath}" -vf scale=1920:1080 "${filepath}.tmp.jpg" -y && mv "${filepath}.tmp.jpg" "${filepath}"`, { stdio: 'pipe' });
+              console.log(`    ✅ Unsplash photo`);
+              unsplashCount++;
+            }
+          }
+        } catch {}
+      }
+      await sleep(1200);
+    }
+
+    // 4. Final fallback: gradient
     if (!success) {
-      console.log(`    🎨 Using FFmpeg gradient image`);
-      createColorImage(filepath, idx);
+      console.log(`    🎨 Using gradient fallback`);
+      createGradientFallback(filepath, idx);
       fallbackCount++;
     }
 
     imagePaths.push(filepath);
-
-    // Wait between requests
-    if (idx < scenes.length - 1) await sleep(2000);
   }
 
-  fs.writeFileSync(
-    'output/images/manifest.json',
-    JSON.stringify({ scenes, imagePaths }, null, 2)
-  );
+  fs.writeFileSync('output/images/manifest.json',
+    JSON.stringify({ scenes, imagePaths }, null, 2));
 
-  console.log(`\n✅ Done: ${pollSuccess} from Pollinations, ${fallbackCount} FFmpeg gradients`);
-  console.log(`📁 Total: ${imagePaths.length} images ready for video assembly`);
+  console.log(`\n✅ Images complete!`);
+  console.log(`   🤖 Gemini AI: ${geminiCount}`);
+  console.log(`   📸 Unsplash: ${unsplashCount}`);
+  console.log(`   🎨 Gradients: ${fallbackCount}`);
 }
 
 main().catch(err => {
-  console.error('❌ Image download failed:', err.message);
+  console.error('❌ Image generation failed:', err.message);
   process.exit(1);
 });
