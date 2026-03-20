@@ -1,114 +1,133 @@
 #!/usr/bin/env python3
 # scripts/generate_tts.py
-# Uses Kokoro-82M — best free local neural TTS, sounds near human quality
-# Ranked just below ElevenLabs on TTS Arena — completely free, runs locally
+# Uses Piper TTS — best balance of quality + speed on CPU
+# Neural voice, sounds natural, installs in seconds, no GPU needed
 
 import os
 import sys
 import subprocess
-import soundfile as sf
-import numpy as np
+import urllib.request
 
-def enhance_audio(audio, sample_rate):
-    """Improve audio quality — normalize volume, remove silence edges"""
-    # Normalize to consistent volume
-    max_val = np.max(np.abs(audio))
-    if max_val > 0:
-        audio = audio / max_val * 0.95
+PIPER_VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx"
+PIPER_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx.json"
 
-    # Fade in (first 0.1 seconds)
-    fade_in_samples = int(sample_rate * 0.1)
-    if len(audio) > fade_in_samples:
-        fade_in = np.linspace(0, 1, fade_in_samples)
-        audio[:fade_in_samples] *= fade_in
+def download_file(url, dest):
+    print(f"  📥 Downloading {os.path.basename(dest)}...")
+    urllib.request.urlretrieve(url, dest)
+    size_mb = os.path.getsize(dest) / 1024 / 1024
+    print(f"  ✅ Downloaded ({size_mb:.1f}MB)")
 
-    # Fade out (last 0.2 seconds)
-    fade_out_samples = int(sample_rate * 0.2)
-    if len(audio) > fade_out_samples:
-        fade_out = np.linspace(1, 0, fade_out_samples)
-        audio[-fade_out_samples:] *= fade_out
+def install_piper():
+    """Install Piper TTS binary"""
+    piper_path = '/tmp/piper/piper'
+    if os.path.exists(piper_path):
+        return piper_path
 
-    return audio
+    print("  📦 Installing Piper TTS...")
+    os.makedirs('/tmp/piper', exist_ok=True)
 
-def generate_with_kokoro(text, output_wav):
-    """Use Kokoro-82M — best free neural TTS"""
-    from kokoro import KPipeline
+    # Download Piper for Linux x86_64
+    piper_url = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"
+    tar_path = '/tmp/piper.tar.gz'
 
-    print("  🧠 Loading Kokoro-82M model (first run downloads ~500MB)...")
-    pipeline = KPipeline(lang_code='a')  # 'a' = American English
-
-    print("  🎙️ Generating with voice: af_heart (warm female voice)...")
-    all_audio = []
-    sample_rate = 24000
-
-    generator = pipeline(
-        text,
-        voice='af_heart',   # Options: af_heart, af_bella, af_sarah, am_adam, am_michael
-        speed=1.05,          # Slightly faster = more energetic YouTube style
-        split_pattern=r'\n+'
-    )
-
-    for i, (gs, ps, audio) in enumerate(generator):
-        all_audio.append(audio)
-        print(f"    ✅ Chunk {i+1} generated")
-
-    if not all_audio:
-        raise Exception("Kokoro generated no audio chunks")
-
-    # Combine all chunks
-    combined = np.concatenate(all_audio)
-
-    # Enhance audio quality
-    combined = enhance_audio(combined, sample_rate)
-
-    # Save as WAV first
-    sf.write(output_wav, combined, sample_rate)
-    print(f"  ✅ WAV saved: {output_wav}")
-    return True
-
-def wav_to_mp3(wav_path, mp3_path):
-    """Convert WAV to MP3 using FFmpeg"""
     result = subprocess.run([
-        'ffmpeg', '-i', wav_path,
-        '-codec:a', 'libmp3lame',
-        '-qscale:a', '2',         # High quality MP3
-        '-ar', '44100',           # Standard sample rate
-        mp3_path, '-y'
+        'curl', '-L', '--silent', '--output', tar_path, piper_url
     ], capture_output=True)
 
     if result.returncode != 0:
-        raise Exception(f"FFmpeg WAV→MP3 failed: {result.stderr.decode()}")
-    print(f"  ✅ MP3 saved: {mp3_path}")
+        raise Exception("Failed to download Piper")
 
-def generate_with_gtts_fallback(text, mp3_path):
-    """Fallback: gTTS if Kokoro fails"""
-    print("  ⚠️ Using gTTS fallback...")
-    from gtts import gTTS
-    tts = gTTS(text=text, lang='en', slow=False)
-    tts.save(mp3_path)
-    print(f"  ✅ gTTS saved: {mp3_path}")
+    subprocess.run(['tar', '-xzf', tar_path, '-C', '/tmp/'], capture_output=True)
+    os.chmod(piper_path, 0o755)
+    print("  ✅ Piper installed")
+    return piper_path
 
-def generate_with_edge_fallback(text, mp3_path):
-    """Fallback: Microsoft edge-tts (also neural, free)"""
-    print("  ⚠️ Using edge-tts fallback (Microsoft neural voice)...")
+def generate_with_piper(text, output_mp3):
+    """Generate audio with Piper — Ryan high quality voice"""
+    piper_path = install_piper()
+
+    # Download voice model
+    model_path = '/tmp/piper/en_US-ryan-high.onnx'
+    config_path = '/tmp/piper/en_US-ryan-high.onnx.json'
+
+    if not os.path.exists(model_path):
+        download_file(PIPER_VOICE_URL, model_path)
+    if not os.path.exists(config_path):
+        download_file(PIPER_CONFIG_URL, config_path)
+
+    output_wav = output_mp3.replace('.mp3', '.wav')
+
+    print("  🎙️ Generating speech with Piper (Ryan - high quality)...")
+
+    # Run Piper
+    result = subprocess.run(
+        [piper_path,
+         '--model', model_path,
+         '--output_file', output_wav,
+         '--sentence_silence', '0.3',   # natural pause between sentences
+         '--length_scale', '0.95'],     # slightly faster = more energetic
+        input=text.encode('utf-8'),
+        capture_output=True,
+        timeout=120
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"Piper failed: {result.stderr.decode()}")
+
+    if not os.path.exists(output_wav) or os.path.getsize(output_wav) < 1000:
+        raise Exception("Piper produced no output")
+
+    # Convert WAV → MP3 with FFmpeg (better quality + smaller size)
+    mp3_result = subprocess.run([
+        'ffmpeg', '-i', output_wav,
+        '-codec:a', 'libmp3lame',
+        '-qscale:a', '2',         # high quality
+        '-ar', '44100',           # standard sample rate
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  # normalize loudness
+        output_mp3, '-y'
+    ], capture_output=True)
+
+    if mp3_result.returncode != 0:
+        raise Exception(f"WAV→MP3 failed: {mp3_result.stderr.decode()}")
+
+    # Clean up WAV
+    try: os.remove(output_wav)
+    except: pass
+
+    size_kb = os.path.getsize(output_mp3) // 1024
+    print(f"  ✅ Piper audio ready ({size_kb}KB)")
+    return True
+
+def generate_with_edge_tts(text, output_mp3):
+    """Fallback: Microsoft edge-tts — also neural quality, free"""
+    print("  ⚠️ Trying edge-tts fallback (Microsoft neural)...")
     subprocess.run(['pip', 'install', 'edge-tts', '--quiet'], check=True)
+
     import asyncio
     import edge_tts
 
     async def _gen():
         communicate = edge_tts.Communicate(
             text,
-            voice="en-US-AriaNeural",  # Microsoft neural voice
-            rate="+5%"
+            voice="en-US-AndrewNeural",  # Deep, professional male voice
+            rate="+5%",
+            volume="+10%"
         )
-        await communicate.save(mp3_path)
+        await communicate.save(output_mp3)
 
     asyncio.run(_gen())
-    print(f"  ✅ edge-tts saved: {mp3_path}")
+    size_kb = os.path.getsize(output_mp3) // 1024
+    print(f"  ✅ edge-tts ready ({size_kb}KB)")
+
+def generate_with_gtts(text, output_mp3):
+    """Last resort fallback"""
+    print("  ⚠️ Using gTTS last resort fallback...")
+    from gtts import gTTS
+    tts = gTTS(text=text, lang='en', slow=False)
+    tts.save(output_mp3)
 
 def main():
     text_file = 'output/voiceover_text.txt'
-    output_wav = 'output/voiceover.wav'
     output_mp3 = 'output/voiceover.mp3'
 
     if not os.path.exists(text_file):
@@ -122,41 +141,33 @@ def main():
         print("❌ Voiceover text is empty!")
         sys.exit(1)
 
-    print(f"🎙️ Generating voiceover ({len(text)} characters)...")
-    print(f"📝 Preview: {text[:100]}...")
-
     os.makedirs('output', exist_ok=True)
 
-    # Try Kokoro first (best quality)
+    print(f"🎙️ Generating voiceover ({len(text)} chars)...")
+    print(f"📝 Preview: {text[:120]}...\n")
+
+    # 1. Try Piper (best quality, fast, CPU-only)
     try:
-        generate_with_kokoro(text, output_wav)
-        wav_to_mp3(output_wav, output_mp3)
-        # Clean up WAV
-        if os.path.exists(output_wav):
-            os.remove(output_wav)
-        size_kb = os.path.getsize(output_mp3) // 1024
-        print(f"\n✅ Kokoro voiceover ready! ({size_kb}KB)")
+        generate_with_piper(text, output_mp3)
+        print(f"\n✅ Piper TTS complete!")
         return
     except Exception as e:
-        print(f"  ⚠️ Kokoro failed: {e}")
+        print(f"  ⚠️ Piper failed: {e}")
 
-    # Try edge-tts (also neural quality)
+    # 2. Try edge-tts (Microsoft neural, also excellent)
     try:
-        generate_with_edge_fallback(text, output_mp3)
-        size_kb = os.path.getsize(output_mp3) // 1024
-        print(f"\n✅ edge-tts voiceover ready! ({size_kb}KB)")
+        generate_with_edge_tts(text, output_mp3)
+        print(f"\n✅ edge-tts complete!")
         return
     except Exception as e:
         print(f"  ⚠️ edge-tts failed: {e}")
 
-    # Last resort: gTTS
+    # 3. Last resort: gTTS
     try:
-        generate_with_gtts_fallback(text, output_mp3)
-        size_kb = os.path.getsize(output_mp3) // 1024
-        print(f"\n✅ gTTS voiceover ready! ({size_kb}KB)")
-        return
+        generate_with_gtts(text, output_mp3)
+        print(f"\n✅ gTTS complete (fallback)!")
     except Exception as e:
-        print(f"❌ All TTS methods failed: {e}")
+        print(f"❌ All TTS failed: {e}")
         sys.exit(1)
 
 if __name__ == '__main__':
