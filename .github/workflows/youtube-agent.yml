@@ -107,7 +107,9 @@ jobs:
       - name: 🖼️ Download scene images
         run: |
           node scripts/download_images.js
-          echo "✅ Images downloaded"
+          # Verify images using curl fallback if needed
+          python3 scripts/verify_images.py
+          echo "✅ Images ready"
 
       # ─── 11. GET BACKGROUND MUSIC (Pixabay — free) ───────────────────────
       - name: 🎵 Get background music
