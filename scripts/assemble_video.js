@@ -1,167 +1,406 @@
 // scripts/assemble_video.js
-// Assembles images + voiceover + music into final MP4 using FFmpeg
+// Shorts-first assembler
+// Priority: avatar video (Wav2Lip output) → fallback gradient
+// NO image dependency — avatar IS the video
 
 const fs = require('fs');
-const { execSync, spawnSync } = require('child_process');
+const { spawnSync, execSync } = require('child_process');
 const path = require('path');
 
-function run(cmd) {
-  console.log(`  🔧 ${cmd.substring(0, 80)}...`);
-  const result = spawnSync('bash', ['-c', cmd], { stdio: 'pipe', timeout: 120000 });
-  if (result.status !== 0) {
-    const stderr = result.stderr ? result.stderr.toString() : '';
-    throw new Error(`FFmpeg error: ${stderr}`);
+// ─── Shorts Config ────────────────────────────────────────────────────────────
+const SHORTS_W   = 1080;
+const SHORTS_H   = 1920;
+const SHORTS_FPS = 30;
+const MAX_SECS   = 58;
+
+function run(cmd, timeout = 300) {
+  console.log(`  🔧 ${cmd.substring(0, 90)}...`);
+  const r = spawnSync('bash', ['-c', cmd], { stdio: 'pipe', timeout: timeout * 1000 });
+  if (r.status !== 0) {
+    throw new Error(r.stderr ? r.stderr.toString().slice(-400) : 'Command failed');
   }
+  return r.stdout ? r.stdout.toString() : '';
 }
 
-function getAudioDuration(audioPath) {
+function tryRun(cmd, timeout = 120) {
+  try { run(cmd, timeout); return true; }
+  catch (e) { console.log(`  ⚠️ ${e.message.slice(0, 120)}`); return false; }
+}
+
+function getDuration(filepath) {
   try {
-    const result = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
-      { stdio: 'pipe' }
-    ).toString().trim();
-    const dur = parseFloat(result);
-    if (isNaN(dur) || dur <= 0) return 90;
-    return dur;
-  } catch {
-    return 90;
-  }
+    const r = spawnSync('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filepath
+    ], { stdio: 'pipe' });
+    const d = parseFloat(r.stdout.toString().trim());
+    return isNaN(d) ? 55 : Math.min(d, MAX_SECS);
+  } catch { return 55; }
+}
+
+function isValidVideo(filepath) {
+  if (!fs.existsSync(filepath)) return false;
+  if (fs.statSync(filepath).size < 10000) return false;
+  try {
+    const r = spawnSync('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filepath
+    ], { stdio: 'pipe' });
+    return r.stdout.toString().trim() === 'video';
+  } catch { return false; }
 }
 
 function isValidAudio(filepath) {
   if (!fs.existsSync(filepath)) return false;
   if (fs.statSync(filepath).size < 1000) return false;
   try {
-    // Check if ffprobe sees it as having an audio stream
-    const result = execSync(
-      `ffprobe -v error -select_streams a -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "${filepath}"`,
-      { stdio: 'pipe' }
-    ).toString().trim();
-    return result.includes('audio');
-  } catch {
-    return false;
+    const r = spawnSync('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filepath
+    ], { stdio: 'pipe' });
+    return r.stdout.toString().trim() === 'audio';
+  } catch { return false; }
+}
+
+function createGradientVideo(outputPath, duration) {
+  console.log('  🎨 Creating gradient background video...');
+  // Dark purple-black gradient — matches female avatar aesthetic
+  tryRun(
+    `ffmpeg -f lavfi ` +
+    `-i "color=c=#0d0d1a:size=${SHORTS_W}x${SHORTS_H}:duration=${duration}:rate=${SHORTS_FPS}" ` +
+    `-c:v libx264 -pix_fmt yuv420p ` +
+    `"${outputPath}" -y`
+  );
+}
+
+function formatToShorts(inputVideo, outputVideo, duration) {
+  console.log(`  📱 Formatting to ${SHORTS_W}x${SHORTS_H} Shorts...`);
+
+  // Scale + pad to 9:16 with dark background, avatar centered top area
+  const ok = tryRun(
+    `ffmpeg -i "${inputVideo}" ` +
+    `-vf "scale=${SHORTS_W}:-2:force_original_aspect_ratio=decrease,` +
+    `pad=${SHORTS_W}:${SHORTS_H}:(ow-iw)/2:80:color=#0d0d1a" ` +
+    `-c:v libx264 -c:a aac ` +
+    `-r ${SHORTS_FPS} -t ${duration} ` +
+    `"${outputVideo}" -y`,
+    120
+  );
+
+  if (!ok) {
+    // Simple fallback pad
+    tryRun(
+      `ffmpeg -i "${inputVideo}" ` +
+      `-vf "scale=${SHORTS_W}:${SHORTS_H}:force_original_aspect_ratio=decrease,` +
+      `pad=${SHORTS_W}:${SHORTS_H}:(ow-iw)/2:(oh-ih)/2:black" ` +
+      `-c:v libx264 -c:a aac -t ${duration} ` +
+      `"${outputVideo}" -y`,
+      120
+    );
   }
 }
 
-function createSilentAudio(filepath, duration) {
-  try {
-    execSync(
-      `ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t ${duration} "${filepath}" -y`,
-      { stdio: 'pipe' }
+function addVoiceover(videoPath, audioPath, outputPath, duration) {
+  console.log('  🎙️ Mixing voiceover audio...');
+
+  const musicPath = 'output/background_music.mp3';
+  const hasMusic = isValidAudio(musicPath);
+
+  if (hasMusic) {
+    tryRun(
+      `ffmpeg -i "${videoPath}" ` +
+      `-i "${audioPath}" ` +
+      `-i "${musicPath}" ` +
+      `-filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.06,apad[music];[voice][music]amix=inputs=2:duration=first[audio]" ` +
+      `-map 0:v -map "[audio]" ` +
+      `-c:v copy -c:a aac -b:a 128k ` +
+      `-shortest -t ${duration} ` +
+      `"${outputPath}" -y`,
+      120
     );
-    return true;
-  } catch {
-    return false;
+  } else {
+    tryRun(
+      `ffmpeg -i "${videoPath}" ` +
+      `-i "${audioPath}" ` +
+      `-map 0:v -map 1:a ` +
+      `-c:v copy -c:a aac -b:a 128k ` +
+      `-shortest -t ${duration} ` +
+      `"${outputPath}" -y`,
+      120
+    );
+  }
+}
+
+function addCaptions(videoPath, scriptText, outputPath, duration) {
+  console.log('  💬 Adding Shorts captions...');
+  if (!scriptText || !scriptText.trim()) {
+    fs.copyFileSync(videoPath, outputPath);
+    return;
+  }
+
+  const words = scriptText.trim().split(/\s+/);
+  const chunkSize = 4;
+  const chunks = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize).join(' '));
+  }
+
+  if (chunks.length === 0) {
+    fs.copyFileSync(videoPath, outputPath);
+    return;
+  }
+
+  const timePerChunk = duration / chunks.length;
+
+  const filters = chunks.map((chunk, i) => {
+    const t0 = (i * timePerChunk).toFixed(2);
+    const t1 = ((i + 1) * timePerChunk).toFixed(2);
+    const safe = chunk
+      .replace(/'/g, ' ')
+      .replace(/"/g, ' ')
+      .replace(/:/g, ' ')
+      .replace(/\\/g, ' ')
+      .replace(/\[/g, '(')
+      .replace(/\]/g, ')')
+      .replace(/,/g, ' ')
+      .substring(0, 40);
+    return (
+      `drawtext=text='${safe}':` +
+      `fontcolor=white:fontsize=58:font=Arial:` +
+      `box=1:boxcolor=black@0.55:boxborderw=14:` +
+      `x=(w-text_w)/2:y=h-250:` +
+      `enable='between(t,${t0},${t1})'`
+    );
+  }).join(',');
+
+  const ok = tryRun(
+    `ffmpeg -i "${videoPath}" ` +
+    `-vf "${filters}" ` +
+    `-c:v libx264 -c:a copy ` +
+    `"${outputPath}" -y`,
+    180
+  );
+
+  if (!ok || !fs.existsSync(outputPath)) {
+    console.log('  ⚠️ Captions failed — using without');
+    fs.copyFileSync(videoPath, outputPath);
+  }
+}
+
+function addTitleCard(videoPath, title, outputPath) {
+  console.log('  🏷️ Adding title card...');
+  const safe = (title || '')
+    .replace(/'/g, ' ')
+    .replace(/"/g, ' ')
+    .replace(/:/g, ' ')
+    .replace(/\\/g, ' ')
+    .substring(0, 45);
+
+  const ok = tryRun(
+    `ffmpeg -i "${videoPath}" ` +
+    `-vf "drawtext=text='${safe}':` +
+    `fontcolor=white:fontsize=36:font=Arial:` +
+    `box=1:boxcolor=black@0.6:boxborderw=10:` +
+    `x=(w-text_w)/2:y=60:` +
+    `enable='lt(t,3)'" ` +
+    `-c:v libx264 -c:a copy ` +
+    `"${outputPath}" -y`,
+    120
+  );
+
+  if (!ok || !fs.existsSync(outputPath)) {
+    fs.copyFileSync(videoPath, outputPath);
   }
 }
 
 async function main() {
-  const manifest = JSON.parse(fs.readFileSync('output/images/manifest.json', 'utf8'));
-  const { imagePaths } = manifest;
-  const validImages = imagePaths.filter(p => p && fs.existsSync(p));
+  console.log('🎬 Assembling YouTube Short...\n');
+  console.log('='.repeat(50));
 
-  if (validImages.length === 0) throw new Error('No valid images found!');
+  if (!fs.existsSync('output')) fs.mkdirSync('output');
 
+  // ── Read script + metadata ─────────────────────────────────────────────────
+  let scriptText = '';
+  let title = '';
+  try {
+    const s = JSON.parse(fs.readFileSync('output/script.json', 'utf8'));
+    scriptText = s.sections?.VOICEOVER || s.raw || '';
+    console.log(`  📝 Script: ${scriptText.substring(0, 60)}...`);
+  } catch { console.log('  ⚠️ No script.json found'); }
+
+  try {
+    const m = JSON.parse(fs.readFileSync('output/metadata.json', 'utf8'));
+    title = m.title || '';
+    console.log(`  📌 Title: ${title}`);
+  } catch { console.log('  ⚠️ No metadata.json found'); }
+
+  // ── Check voiceover ────────────────────────────────────────────────────────
   const voiceoverPath = 'output/voiceover.mp3';
-  const musicPath = 'output/background_music.mp3';
-  const outputPath = 'output/final_video.mp4';
-
-  console.log(`🎬 Assembling video with ${validImages.length} scenes...`);
-
-  // ─── Validate voiceover ──────────────────────────────────────────────────
   if (!isValidAudio(voiceoverPath)) {
-    throw new Error('Voiceover file is missing or not valid audio!');
+    throw new Error('voiceover.mp3 missing or invalid!');
+  }
+  const duration = getDuration(voiceoverPath);
+  console.log(`\n  ⏱️ Duration: ${duration.toFixed(1)}s`);
+
+  // ── Step 1: Get base video ─────────────────────────────────────────────────
+  console.log('\n📹 Step 1: Finding base video...');
+
+  const avatarOut = 'output/final_video.mp4';    // Wav2Lip output
+  const rawAvatar = 'output/wav2lip_raw.mp4';    // Raw Wav2Lip
+  const faceSource = 'output/face_source.mp4';   // Face video
+
+  let baseVideo = null;
+
+  // Priority 1 — Wav2Lip fully processed avatar (best)
+  if (isValidVideo(avatarOut) && fs.statSync(avatarOut).size > 500000) {
+    console.log('  ✅ Using Wav2Lip processed avatar (output/final_video.mp4)');
+    baseVideo = avatarOut;
+  }
+  // Priority 2 — Raw Wav2Lip output
+  else if (isValidVideo(rawAvatar)) {
+    console.log('  ✅ Using raw Wav2Lip output (output/wav2lip_raw.mp4)');
+    baseVideo = rawAvatar;
+  }
+  // Priority 3 — Face source video (avatar_base.mp4 animated)
+  else if (isValidVideo(faceSource)) {
+    console.log('  ✅ Using face source video (output/face_source.mp4)');
+    baseVideo = faceSource;
+  }
+  // Priority 4 — Original avatar_base.mp4 from repo
+  else if (isValidVideo('avatar_base.mp4')) {
+    console.log('  ✅ Using avatar_base.mp4 directly');
+    baseVideo = 'avatar_base.mp4';
+  }
+  // Priority 5 — Generate gradient fallback
+  else {
+    console.log('  ⚠️ No avatar video found — using gradient background');
+    const gradPath = 'output/gradient_bg.mp4';
+    createGradientVideo(gradPath, duration);
+    baseVideo = gradPath;
   }
 
-  const totalDuration = getAudioDuration(voiceoverPath);
-  const sceneDuration = totalDuration / validImages.length;
-  console.log(`  ⏱️ Total duration: ${totalDuration.toFixed(1)}s`);
-  console.log(`  🎞️ Scene duration: ${sceneDuration.toFixed(1)}s each`);
+  console.log(`  📁 Base video: ${baseVideo}`);
 
-  // ─── Validate background music ───────────────────────────────────────────
-  let hasMusic = false;
-  if (fs.existsSync(musicPath)) {
-    if (isValidAudio(musicPath)) {
-      hasMusic = true;
-      console.log('  🎵 Background music: valid ✅');
-    } else {
-      console.log('  ⚠️ background_music.mp3 is not valid audio — skipping music');
-      // Remove the corrupt file so it doesn't cause issues
-      try { fs.unlinkSync(musicPath); } catch {}
+  // ── Step 2: Format to Shorts 9:16 ─────────────────────────────────────────
+  console.log('\n📱 Step 2: Formatting to 9:16 Shorts...');
+  const shortsFormatted = 'output/shorts_formatted.mp4';
+
+  // If already final_video.mp4 from avatar pipeline (already 9:16), skip reformat
+  if (baseVideo === avatarOut) {
+    console.log('  ✅ Avatar already formatted — skipping reformat');
+    fs.copyFileSync(avatarOut, shortsFormatted);
+  } else {
+    formatToShorts(baseVideo, shortsFormatted, duration);
+  }
+
+  if (!fs.existsSync(shortsFormatted)) {
+    throw new Error('Shorts formatting failed!');
+  }
+
+  // ── Step 3: Add voiceover (only if not already in avatar video) ────────────
+  console.log('\n🎙️ Step 3: Adding voiceover...');
+  const withAudio = 'output/shorts_audio.mp4';
+
+  // Check if base already has good audio (Wav2Lip output does)
+  const baseHasAudio = (() => {
+    try {
+      const r = spawnSync('ffprobe', [
+        '-v', 'error', '-select_streams', 'a:0',
+        '-show_entries', 'stream=codec_type',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        shortsFormatted
+      ], { stdio: 'pipe' });
+      return r.stdout.toString().trim() === 'audio';
+    } catch { return false; }
+  })();
+
+  if (baseHasAudio && (baseVideo === avatarOut || baseVideo === rawAvatar)) {
+    console.log('  ✅ Avatar video already has voiceover audio');
+    fs.copyFileSync(shortsFormatted, withAudio);
+  } else {
+    addVoiceover(shortsFormatted, voiceoverPath, withAudio, duration);
+    if (!fs.existsSync(withAudio)) {
+      fs.copyFileSync(shortsFormatted, withAudio);
     }
+  }
+
+  // ── Step 4: Add captions ───────────────────────────────────────────────────
+  console.log('\n💬 Step 4: Adding captions...');
+  const withCaptions = 'output/shorts_captions.mp4';
+  addCaptions(withAudio, scriptText, withCaptions, duration);
+  const captionSrc = fs.existsSync(withCaptions) ? withCaptions : withAudio;
+
+  // ── Step 5: Add title card ─────────────────────────────────────────────────
+  console.log('\n🏷️ Step 5: Adding title card...');
+  const withTitle = 'output/shorts_titled.mp4';
+  if (title) {
+    addTitleCard(captionSrc, title, withTitle);
   } else {
-    console.log('  ⚠️ No background music file found — continuing without music');
+    fs.copyFileSync(captionSrc, withTitle);
   }
+  const titleSrc = fs.existsSync(withTitle) ? withTitle : captionSrc;
 
-  // ─── Step 1: Create video segment for each image ────────────────────────
-  const segmentPaths = [];
-  for (let i = 0; i < validImages.length; i++) {
-    const segPath = `output/segment_${i}.mp4`;
-    const frames = Math.ceil(sceneDuration * 25);
-    const zoomDir = i % 2 === 0 ? '+' : '-';
-    const zoomEnd = i % 2 === 0 ? '1.05' : '0.97';
+  // ── Step 6: Final output ───────────────────────────────────────────────────
+  console.log('\n✅ Step 6: Finalizing...');
+  fs.copyFileSync(titleSrc, 'output/final_video.mp4');
 
-    run(`ffmpeg -loop 1 -i "${validImages[i]}" \
-      -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(zoom+0.0015,${zoomEnd})':d=${frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080,setsar=1" \
-      -t ${sceneDuration} \
-      -c:v libx264 -pix_fmt yuv420p -r 25 \
-      "${segPath}" -y`);
+  // ── Cleanup temp files ─────────────────────────────────────────────────────
+  const temps = [
+    'output/shorts_formatted.mp4',
+    'output/shorts_audio.mp4',
+    'output/shorts_captions.mp4',
+    'output/shorts_titled.mp4',
+    'output/gradient_bg.mp4',
+    'output/voiceover.wav',
+    'output/wav2lip_raw.mp4',
+    'output/face_source.mp4',
+    'output/shorts_base.mp4',
+    'output/shorts_branded.mp4',
+    'output/avatar_raw.mp4',
+  ];
+  temps.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
 
-    segmentPaths.push(segPath);
-  }
+  // ── Final stats ────────────────────────────────────────────────────────────
+  const finalPath = 'output/final_video.mp4';
+  if (!fs.existsSync(finalPath)) throw new Error('Final video missing!');
 
-  // ─── Step 2: Concatenate segments ───────────────────────────────────────
-  const concatFile = 'output/concat_list.txt';
-  fs.writeFileSync(concatFile, segmentPaths.map(p => `file '${path.resolve(p)}'`).join('\n'));
-
-  const concatenatedPath = 'output/concatenated.mp4';
-  run(`ffmpeg -f concat -safe 0 -i "${concatFile}" -c copy "${concatenatedPath}" -y`);
-
-  // ─── Step 3: Mix audio ───────────────────────────────────────────────────
-  if (hasMusic) {
-    // Voiceover + background music
-    run(`ffmpeg -i "${concatenatedPath}" \
-      -i "${voiceoverPath}" \
-      -i "${musicPath}" \
-      -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.08,apad[music];[voice][music]amix=inputs=2:duration=first[audio]" \
-      -map 0:v -map "[audio]" \
-      -c:v copy -c:a aac -b:a 128k \
-      -shortest \
-      "${outputPath}" -y`);
-  } else {
-    // Voiceover only — no background music
-    run(`ffmpeg -i "${concatenatedPath}" \
-      -i "${voiceoverPath}" \
-      -map 0:v -map 1:a \
-      -c:v copy -c:a aac -b:a 128k \
-      -shortest \
-      "${outputPath}" -y`);
-  }
-
-  // ─── Step 4: Add title overlay ───────────────────────────────────────────
-  const metadata = JSON.parse(fs.readFileSync('output/metadata.json', 'utf8'));
-  const title = metadata.title.replace(/[':]/g, '').substring(0, 50);
-  const finalWithTitle = 'output/final_titled.mp4';
-
-  run(`ffmpeg -i "${outputPath}" \
-    -vf "drawtext=text='${title}':fontcolor=white:fontsize=44:box=1:boxcolor=black@0.6:boxborderw=10:x=(w-text_w)/2:y=h-150:enable='lt(t,4)'" \
-    -c:v libx264 -c:a copy \
-    "${finalWithTitle}" -y`);
-
-  fs.renameSync(finalWithTitle, outputPath);
-
-  // ─── Cleanup ─────────────────────────────────────────────────────────────
-  segmentPaths.forEach(p => { try { fs.unlinkSync(p); } catch {} });
-  try { fs.unlinkSync(concatenatedPath); } catch {}
-  try { fs.unlinkSync(concatFile); } catch {}
-
-  const sizeMB = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
-  console.log(`\n✅ Video assembled: ${outputPath}`);
-  console.log(`📦 File size: ${sizeMB} MB`);
-  console.log(`⏱️ Duration: ${totalDuration.toFixed(0)} seconds`);
+  const sizeMB = (fs.statSync(finalPath).size / 1024 / 1024).toFixed(1);
+  console.log('\n' + '='.repeat(50));
+  console.log(`🎉 YouTube Short READY!`);
+  console.log(`📁 File    : ${finalPath}`);
+  console.log(`📦 Size    : ${sizeMB}MB`);
+  console.log(`⏱️ Duration: ${duration.toFixed(0)}s`);
+  console.log(`📱 Format  : ${SHORTS_W}x${SHORTS_H} vertical`);
+  console.log(`💋 Avatar  : ${baseVideo}`);
+  console.log('='.repeat(50));
 }
 
 main().catch(err => {
   console.error('❌ Video assembly failed:', err.message);
   process.exit(1);
 });
+```
+
+---
+
+## What This Does
+```
+avatar output exists?
+    ↓ YES → use it (already lip synced + formatted)
+    ↓ NO  → use wav2lip_raw.mp4
+    ↓ NO  → use face_source.mp4
+    ↓ NO  → use avatar_base.mp4 directly
+    ↓ NO  → gradient fallback
+
+    + voiceover audio mixed in
+    + bold captions (4 words/chunk)
+    + title card (first 3 seconds)
+    = final_video.mp4 (Shorts 9:16)
