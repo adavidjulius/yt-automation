@@ -57,6 +57,7 @@ jobs:
           pip install edge-tts --quiet
           pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu --quiet
           pip install opencv-python-headless --quiet
+          pip install tqdm batch_face librosa --quiet
           echo "✅ Python packages ready"
 
       - name: 🔥 Fetch trending topic
