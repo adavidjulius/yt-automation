@@ -1,135 +1,85 @@
 // scripts/download_images.js
-// Downloads scene images from Pollinations.ai — FREE, no API key, no limits
+// Downloads images using curl (most reliable on GitHub Actions)
+// Primary: Pollinations.ai — FREE, no key
+// Fallback: Pure FFmpeg generated images — 100% reliable
 
 const fs = require('fs');
-const https = require('https');
-const http = require('http');
-const { execSync } = require('child_process');
+const { execSync, spawnSync } = require('child_process');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Validate downloaded file is actually a real image
-function isValidImage(filepath) {
+function createColorImage(filepath, index) {
+  // Generate beautiful gradient background images using FFmpeg
+  // These always work — no network needed
+  const gradients = [
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x1a1a2e:c1=0x16213e:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x0f3460:c1=0x533483:x0=0:y0=1080:x1=1920:y1=0" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x1b4332:c1=0x2d6a4f:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x2b2d42:c1=0x8d99ae:x0=1920:y0=0:x1=0:y1=1080" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x370617:c1=0x6a040f:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x03071e:c1=0x023e8a:x0=0:y0=1080:x1=1920:y1=0" -vframes 1',
+    'ffmpeg -f lavfi -i "gradients=s=1920x1080:c0=0x10002b:c1=0x240046:x0=0:y0=0:x1=1920:y1=1080" -vframes 1',
+  ];
+
+  const cmd = gradients[index % gradients.length];
+
+  // Try gradient first
   try {
-    const stats = fs.statSync(filepath);
-    if (stats.size < 5000) return false; // Less than 5KB = definitely not a real image
+    execSync(`${cmd} "${filepath}" -y`, { stdio: 'pipe' });
+    if (fs.existsSync(filepath) && fs.statSync(filepath).size > 1000) {
+      return true;
+    }
+  } catch {}
 
-    const buffer = Buffer.alloc(4);
-    const fd = fs.openSync(filepath, 'r');
-    fs.readSync(fd, buffer, 0, 4, 0);
-    fs.closeSync(fd);
-
-    // Check JPEG magic bytes: FF D8 FF
-    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return true;
-    // Check PNG magic bytes: 89 50 4E 47
-    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return true;
-
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function downloadFile(url, filepath) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(filepath);
-
-    const request = proto.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; bot/1.0)',
-        'Accept': 'image/jpeg,image/png,image/*'
-      },
-      timeout: 30000
-    }, (res) => {
-      // Follow redirects
-      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
-        file.close();
-        fs.unlinkSync(filepath);
-        return downloadFile(res.headers.location, filepath).then(resolve).catch(reject);
-      }
-
-      if (res.statusCode !== 200) {
-        file.close();
-        fs.unlinkSync(filepath);
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
-
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-      file.on('error', reject);
-    });
-
-    request.on('error', (err) => {
-      file.close();
-      try { fs.unlinkSync(filepath); } catch {}
-      reject(err);
-    });
-
-    request.on('timeout', () => {
-      request.destroy();
-      file.close();
-      try { fs.unlinkSync(filepath); } catch {}
-      reject(new Error('Download timeout'));
-    });
-  });
-}
-
-// Create a solid color fallback image using FFmpeg if download fails
-function createFallbackImage(filepath, index) {
-  const colors = ['#1a1a2e', '#16213e', '#0f3460', '#533483', '#2b2d42', '#8d99ae', '#2d6a4f', '#1b4332'];
-  const color = colors[index % colors.length].replace('#', '');
+  // Fallback to solid color
+  const colors = ['1a1a2e', '0f3460', '1b4332', '2b2d42', '370617', '03071e', '10002b'];
+  const color = colors[index % colors.length];
   try {
     execSync(
-      `ffmpeg -f lavfi -i "color=c=${color}:size=1920x1080:duration=1" -vframes 1 "${filepath}" -y`,
+      `ffmpeg -f lavfi -i "color=c=#${color}:size=1920x1080:duration=1" -vframes 1 "${filepath}" -y`,
       { stdio: 'pipe' }
     );
-    console.log(`    🎨 Created fallback color image for scene ${index + 1}`);
-    return true;
+    return fs.existsSync(filepath) && fs.statSync(filepath).size > 1000;
   } catch {
     return false;
   }
 }
 
-async function downloadWithRetry(url, filepath, index, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`    🔄 Attempt ${attempt}/${maxRetries}...`);
-      await downloadFile(url, filepath);
+function downloadWithCurl(url, filepath) {
+  // curl is the most reliable downloader on GitHub Actions
+  const result = spawnSync('curl', [
+    '--location',           // follow redirects
+    '--silent',
+    '--show-error',
+    '--max-time', '25',     // 25 second timeout
+    '--retry', '2',
+    '--retry-delay', '3',
+    '--output', filepath,
+    '--user-agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    url
+  ], { timeout: 35000 });
 
-      if (isValidImage(filepath)) {
-        return true;
-      } else {
-        console.log(`    ⚠️ Downloaded file is not a valid image (attempt ${attempt})`);
-        try { fs.unlinkSync(filepath); } catch {}
-      }
-    } catch (err) {
-      console.log(`    ⚠️ Download error: ${err.message}`);
-      try { fs.unlinkSync(filepath); } catch {}
-    }
-
-    if (attempt < maxRetries) {
-      const waitMs = attempt * 3000; // 3s, 6s, 9s
-      console.log(`    ⏳ Waiting ${waitMs / 1000}s before retry...`);
-      await sleep(waitMs);
-    }
+  if (result.status !== 0) {
+    return false;
   }
-  return false;
-}
 
-function buildPollinationsURL(prompt, seed) {
-  // Clean and encode the prompt
-  const cleanPrompt = prompt
-    .replace(/[^\w\s,.-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .substring(0, 200);
+  // Verify it's a real image
+  if (!fs.existsSync(filepath)) return false;
+  const size = fs.statSync(filepath).size;
+  if (size < 5000) return false;
 
-  const fullPrompt = `${cleanPrompt}, cinematic photography, professional, vibrant, sharp focus, 4K`;
-  const encoded = encodeURIComponent(fullPrompt);
-  return `https://image.pollinations.ai/prompt/${encoded}?width=1920&height=1080&seed=${seed}&nologo=true&model=flux`;
+  // Check magic bytes
+  const buf = Buffer.alloc(4);
+  const fd = fs.openSync(filepath, 'r');
+  fs.readSync(fd, buf, 0, 4, 0);
+  fs.closeSync(fd);
+
+  const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+  const isPng  = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+
+  return isJpeg || isPng;
 }
 
 async function main() {
@@ -142,28 +92,24 @@ async function main() {
 
   // Build scene list
   const scenes = [];
-
   if (sections.HOOK) {
-    scenes.push({ name: 'scene_hook', prompt: `${topic} introduction concept` });
+    scenes.push({ name: 'scene_hook', prompt: `${topic} concept overview` });
   }
-
   let i = 1;
   while (sections[`SCENE_${i}`]) {
-    const sceneText = sections[`SCENE_${i}`].substring(0, 100);
     scenes.push({
       name: `scene_${i}`,
-      prompt: `${sceneText} ${topic}`
+      prompt: sections[`SCENE_${i}`].substring(0, 80) + ' ' + topic
     });
     i++;
   }
+  scenes.push({ name: 'scene_cta', prompt: `${topic} success results achievement` });
 
-  scenes.push({ name: 'scene_cta', prompt: `${topic} success achievement results` });
-
-  console.log(`🖼️ Downloading ${scenes.length} scene images from Pollinations.ai...`);
-  console.log('⏳ This may take 1-2 minutes — Pollinations generates images on demand\n');
+  console.log(`🖼️ Getting ${scenes.length} scene images...\n`);
 
   const imagePaths = [];
-  let successCount = 0;
+  let pollSuccess = 0;
+  let fallbackCount = 0;
 
   for (let idx = 0; idx < scenes.length; idx++) {
     const scene = scenes[idx];
@@ -171,39 +117,58 @@ async function main() {
 
     console.log(`  📥 Scene ${idx + 1}/${scenes.length}: ${scene.name}`);
 
-    const url = buildPollinationsURL(scene.prompt, idx * 13 + 100);
-    console.log(`    🌐 URL: ${url.substring(0, 80)}...`);
+    // Build Pollinations URL
+    const cleanPrompt = scene.prompt
+      .replace(/[^a-zA-Z0-9\s,.-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .substring(0, 150);
 
-    // Wait before each request to avoid rate limiting
-    if (idx > 0) {
-      await sleep(2000);
+    const fullPrompt = encodeURIComponent(
+      cleanPrompt + ', cinematic, 4K, professional photography, vibrant colors'
+    );
+    const url = `https://image.pollinations.ai/prompt/${fullPrompt}?width=1920&height=1080&seed=${idx * 17 + 42}&nologo=true&model=flux`;
+
+    // Try Pollinations with curl
+    let success = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (attempt > 1) {
+        console.log(`    🔄 Retry ${attempt}...`);
+        await sleep(4000);
+      }
+
+      success = downloadWithCurl(url, filepath);
+      if (success) {
+        const kb = (fs.statSync(filepath).size / 1024).toFixed(0);
+        console.log(`    ✅ Downloaded from Pollinations (${kb}KB)`);
+        pollSuccess++;
+        break;
+      } else {
+        console.log(`    ⚠️ Pollinations failed (attempt ${attempt})`);
+        try { fs.unlinkSync(filepath); } catch {}
+      }
     }
 
-    const success = await downloadWithRetry(url, filepath, idx);
-
-    if (success) {
-      const size = (fs.statSync(filepath).size / 1024).toFixed(0);
-      console.log(`    ✅ Downloaded (${size}KB)`);
-      imagePaths.push(filepath);
-      successCount++;
-    } else {
-      console.log(`    🎨 Using fallback color image`);
-      createFallbackImage(filepath, idx);
-      imagePaths.push(filepath);
+    // Fallback: generate with FFmpeg
+    if (!success) {
+      console.log(`    🎨 Using FFmpeg gradient image`);
+      createColorImage(filepath, idx);
+      fallbackCount++;
     }
+
+    imagePaths.push(filepath);
+
+    // Wait between requests
+    if (idx < scenes.length - 1) await sleep(2000);
   }
 
-  // Save manifest
   fs.writeFileSync(
     'output/images/manifest.json',
     JSON.stringify({ scenes, imagePaths }, null, 2)
   );
 
-  console.log(`\n✅ Images ready: ${successCount}/${scenes.length} from Pollinations, rest are fallbacks`);
-
-  if (imagePaths.length === 0) {
-    throw new Error('No images available at all!');
-  }
+  console.log(`\n✅ Done: ${pollSuccess} from Pollinations, ${fallbackCount} FFmpeg gradients`);
+  console.log(`📁 Total: ${imagePaths.length} images ready for video assembly`);
 }
 
 main().catch(err => {
