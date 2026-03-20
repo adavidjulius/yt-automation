@@ -1,26 +1,22 @@
 // scripts/generate_script.js
-// Calls Groq API to generate a YouTube video script
-// Free tier: 1000 requests/day — no credit card needed
+// Groq API — 55-second YouTube Shorts script
 
 const fs = require('fs');
 const https = require('https');
 
-const topic = process.argv[2] || 'Top 5 AI Tools in 2026';
+const topic = process.argv[2] || 'Top AI Tools in 2026';
 
 async function callGroq(prompt) {
   const body = JSON.stringify({
     model: 'llama-3.3-70b-versatile',
-    max_tokens: 1000,
+    max_tokens: 800,
     temperature: 0.7,
     messages: [
       {
         role: 'system',
-        content: 'You are an expert YouTube scriptwriter. You write viral, engaging scripts that keep viewers hooked. Always use a conversational, energetic tone.'
+        content: 'You are an expert YouTube Shorts scriptwriter. You write punchy, viral 55-second scripts that hook viewers in the first 2 seconds. Energetic, conversational tone. Short sentences.'
       },
-      {
-        role: 'user',
-        content: prompt
-      }
+      { role: 'user', content: prompt }
     ]
   });
 
@@ -43,10 +39,10 @@ async function callGroq(prompt) {
         try {
           const json = JSON.parse(data);
           if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
-          if (!json.choices || !json.choices[0]) throw new Error('No choices in response: ' + data);
+          if (!json.choices?.[0]) throw new Error('No choices: ' + data);
           resolve(json.choices[0].message.content);
         } catch (e) {
-          reject(new Error('Failed to parse Groq response: ' + e.message));
+          reject(new Error('Groq parse error: ' + e.message));
         }
       });
     });
@@ -58,66 +54,60 @@ async function callGroq(prompt) {
 }
 
 async function main() {
-  console.log(`🎬 Generating script for: "${topic}"`);
-
+  console.log(`🎬 Generating 55-sec Shorts script: "${topic}"`);
   if (!fs.existsSync('output')) fs.mkdirSync('output');
 
-  const prompt = `Write a 90-second YouTube video script about: "${topic}"
+  const prompt = `Write a 55-second YouTube Shorts script about: "${topic}"
 
-Format your response EXACTLY like this (keep the labels):
+Format EXACTLY like this (keep labels):
 
 HOOK:
-[A punchy 1-2 sentence hook that grabs attention in the first 3 seconds]
+[1 punchy sentence — hook viewer in 2 seconds, start with "Did you know" or shocking fact]
 
 SCENE_1:
-[First main point - 2-3 sentences, vivid and specific]
+[First point — 2 short sentences max]
 
 SCENE_2:
-[Second main point - 2-3 sentences, build on scene 1]
+[Second point — 2 short sentences max]
 
 SCENE_3:
-[Third main point - 2-3 sentences, most impactful]
+[Third point — 2 short sentences max]
 
 SCENE_4:
-[Fourth point or deeper insight - 2-3 sentences]
-
-SCENE_5:
-[Fifth point - wrap up the main value]
+[Final point + wrap up — 1-2 short sentences]
 
 CTA:
-[Call to action: like, subscribe, comment. Make it feel natural, not forced]
+[1 sentence — like, follow, comment. Natural not forced]
 
 VOICEOVER:
-[The complete script as one flowing paragraph the narrator will read aloud - natural speech, no scene labels]`;
+[Complete script as ONE flowing paragraph for narrator — natural speech, no labels, max 130 words]`;
 
   const script = await callGroq(prompt);
 
+  // Parse sections
   const sections = {};
   const lines = script.split('\n');
   let currentSection = null;
   let currentContent = [];
 
   for (const line of lines) {
-    const sectionMatch = line.match(/^(HOOK|SCENE_\d+|CTA|VOICEOVER):$/);
-    if (sectionMatch) {
-      if (currentSection) {
-        sections[currentSection] = currentContent.join('\n').trim();
-      }
-      currentSection = sectionMatch[1];
+    const match = line.match(/^(HOOK|SCENE_\d+|CTA|VOICEOVER):$/);
+    if (match) {
+      if (currentSection) sections[currentSection] = currentContent.join('\n').trim();
+      currentSection = match[1];
       currentContent = [];
     } else if (currentSection) {
       currentContent.push(line);
     }
   }
-  if (currentSection) {
-    sections[currentSection] = currentContent.join('\n').trim();
-  }
+  if (currentSection) sections[currentSection] = currentContent.join('\n').trim();
 
   fs.writeFileSync('output/script.json', JSON.stringify({ topic, sections, raw: script }, null, 2));
   fs.writeFileSync('output/voiceover_text.txt', sections.VOICEOVER || script);
 
-  console.log('✅ Script saved to output/script.json');
-  console.log('📝 Scenes found:', Object.keys(sections).filter(k => k.startsWith('SCENE')).length);
+  console.log('✅ Script saved');
+  console.log('📝 Scenes:', Object.keys(sections).filter(k => k.startsWith('SCENE')).length);
+  console.log('🎤 Voiceover preview:', (sections.VOICEOVER || '').substring(0, 80) + '...');
 }
 
 main().catch(err => {
